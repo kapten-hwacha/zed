@@ -22,20 +22,20 @@ mod visual;
 use crate::normal::paste::Paste as VimPaste;
 use collections::HashMap;
 use editor::{
-    Anchor, Bias, Editor, EditorEvent, EditorSettings, MultiBufferOffset, NavigationOverlayKey,
-    NavigationTargetOverlay, SelectionEffects,
+    Anchor, Bias, DisplayPoint, Editor, EditorEvent, EditorSettings, MultiBufferOffset,
+    NativeInput, NavigationOverlayKey, NavigationTargetOverlay, SelectionEffects,
     actions::Paste,
-    display_map::ToDisplayPoint,
-    movement::{self, FindRange},
+    display_map::{DisplaySnapshot, PendingRowGeometry, ToDisplayPoint},
+    movement::{self, FindRange, TextLayoutDetails},
 };
 use gpui::{
-    Action, App, AppContext, Axis, Context, Entity, EventEmitter, Focusable, KeyContext,
-    KeystrokeEvent, Render, Subscription, Task, WeakEntity, Window, actions,
+    Action, App, AppContext, Axis, ClipboardReadMode, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, KeyContext, KeystrokeEvent, Render, Subscription, Task, WeakEntity, Window, actions,
 };
 use insert::{NormalBefore, TemporaryNormal};
 use language::{CursorShape, Point, Selection, SelectionGoal, TransactionId};
 pub use mode_indicator::ModeIndicator;
-use motion::Motion;
+use motion::{Motion, MotionKind};
 use multi_buffer::ToPoint as _;
 use normal::search::SearchSubmit;
 use object::Object;
@@ -47,9 +47,10 @@ pub use settings::{
     ModeContent, Settings, SettingsStore, UseSystemClipboard, update_settings_file,
 };
 use state::{
-    HelixJumpBehaviour, HelixJumpLabel, Mode, Operator, RecordedSelection, SearchState, VimGlobals,
+    HelixJumpBehaviour, HelixJumpLabel, MacroInput, MacroInputScope, Mode, Operator,
+    RecordedSelection, Register, SearchState, VimCommandContext, VimGlobals, VimInputState,
 };
-use std::{mem, ops::Range, sync::Arc};
+use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
 use surrounds::SurroundsType;
 use theme_settings::ThemeSettings;
 use ui::{IntoElement, SharedString, px};
@@ -61,6 +62,18 @@ use crate::{
     normal::{GoToPreviousTab, GoToTab},
     state::ReplayableAction,
 };
+
+type GeometryCommit = Box<dyn FnOnce(&mut Vim, &mut Window, &mut Context<Vim>)>;
+
+struct MotionSelections(HashMap<usize, (Selection<DisplayPoint>, Option<MotionKind>)>);
+
+impl MotionSelections {
+    fn apply(&self, selection: &mut Selection<DisplayPoint>) -> Option<MotionKind> {
+        let (planned, kind) = self.0.get(&selection.id)?;
+        *selection = *planned;
+        *kind
+    }
+}
 
 enum HelixJumpNavigationOverlay {}
 
@@ -344,7 +357,9 @@ pub fn init(cx: &mut App) {
                 let digit = n.0;
                 vim.entity.update(cx, |_, cx| {
                     cx.defer_in(window, move |vim, window, cx| {
-                        vim.push_count_digit(digit, window, cx)
+                        VimGlobals::with_input(vim.input.clone(), cx, |cx| {
+                            vim.push_count_digit(digit, window, cx);
+                        });
                     })
                 });
             } else {
@@ -536,6 +551,7 @@ pub(crate) struct Vim {
     pub search: SearchState,
 
     editor: WeakEntity<Editor>,
+    input: Rc<RefCell<VimInputState>>,
 
     last_command: Option<String>,
     running_command: Option<Task<()>>,
@@ -567,7 +583,11 @@ impl Vim {
     /// The namespace for Vim actions.
     const NAMESPACE: &'static str = "vim";
 
-    pub fn new(window: &mut Window, cx: &mut Context<Editor>) -> Entity<Self> {
+    pub fn new(
+        focus_handle: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> Entity<Self> {
         let editor = cx.entity();
 
         let initial_vim_mode = VimSettings::get_global(cx).default_mode;
@@ -584,7 +604,8 @@ impl Vim {
             (initial_vim_mode, Mode::Normal)
         };
 
-        cx.new(|cx| Vim {
+        let input = VimInputState::new(editor.downgrade());
+        let vim = cx.new(|cx: &mut Context<Self>| Vim {
             mode,
             last_mode,
             temp_mode: false,
@@ -608,13 +629,86 @@ impl Vim {
             running_command: None,
 
             editor: editor.downgrade(),
+            input: input.clone(),
             _subscriptions: vec![
-                cx.observe_keystrokes(Self::observe_keystrokes),
+                cx.on_focus(&focus_handle, window, |vim, window, cx| {
+                    VimGlobals::with_input(vim.input.clone(), cx, |cx| {
+                        vim.focused(true, window, cx)
+                    });
+                }),
+                cx.on_blur(&focus_handle, window, |vim, window, cx| {
+                    VimGlobals::with_input(vim.input.clone(), cx, |cx| vim.blurred(window, cx));
+                }),
+                cx.intercept_keystrokes({
+                    let editor = editor.downgrade();
+                    let input = input.clone();
+                    move |event, window, cx| {
+                        if event.keystroke.is_ime_in_progress() {
+                            return;
+                        }
+                        let mut recording = None;
+                        let queued = editor
+                            .update(cx, |editor, cx| {
+                                if !editor.focus_handle(cx).is_focused(window) {
+                                    return false;
+                                }
+                                recording = MacroInput::capture(cx);
+                                let origin = cx.weak_entity();
+                                editor.defer_keystroke_input(
+                                    |window, _| {
+                                        let replay = window.keystroke_replay_with_context(
+                                            event.keystroke.clone(),
+                                            event.input_preference,
+                                            move |window, cx| {
+                                                origin
+                                                    .update(cx, |editor, cx| {
+                                                        editor.key_context(window, cx)
+                                                    })
+                                                    .ok()
+                                            },
+                                        );
+                                        let input = input.clone();
+                                        let recording = recording.clone();
+                                        Box::new(move |window, cx| {
+                                            let scope =
+                                                MacroInputScope::new(input.clone(), recording, cx);
+                                            VimGlobals::with_input(input, cx, |cx| {
+                                                replay(window, cx)
+                                            });
+                                            scope.finish_after_input(cx);
+                                        })
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if queued {
+                            cx.stop_propagation();
+                        } else if recording.is_some() {
+                            MacroInputScope::new(input.clone(), recording, cx)
+                                .finish_after_input(cx);
+                        }
+                    }
+                }),
                 cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
                     this.handle_editor_event(event, window, cx)
                 }),
             ],
-        })
+        });
+        Vim::globals(cx)
+            .keystroke_observers
+            .push((focus_handle, vim.downgrade()));
+        vim.update(cx, |_, cx| {
+            let id = cx.entity_id();
+            cx.on_release(move |_, cx| {
+                Vim::globals(cx)
+                    .keystroke_observers
+                    .retain(|(_, vim)| vim.entity_id() != id);
+            })
+            .detach();
+        });
+        vim
     }
 
     fn register(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Context<Editor>) {
@@ -666,7 +760,7 @@ impl Vim {
     }
 
     fn activate(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
-        let vim = Vim::new(window, cx);
+        let vim = Vim::new(editor.focus_handle(cx), window, cx);
         let state = vim.update(cx, |vim, cx| {
             if !editor.use_modal_editing() {
                 vim.mode = Mode::Insert;
@@ -718,7 +812,11 @@ impl Vim {
                 },
             );
             Vim::action(editor, cx, |_, _: &PushForcedMotion, _, cx| {
-                Vim::globals(cx).forced_motion = true;
+                let globals = Vim::globals(cx);
+                globals.forced_motion = true;
+                if let Some(execution) = &mut globals.execution {
+                    execution.forced_motion = Some(true);
+                }
             });
             Vim::action(editor, cx, |vim, action: &PushObject, window, cx| {
                 vim.push_operator(
@@ -881,7 +979,8 @@ impl Vim {
             });
 
             Vim::action(editor, cx, |vim, _: &PushRegister, window, cx| {
-                vim.push_operator(Operator::Register, window, cx)
+                let recording = Vim::globals(cx).recording_checkpoint();
+                vim.push_operator(Operator::Register { recording }, window, cx)
             });
 
             Vim::action(editor, cx, |vim, _: &PushRecordRegister, window, cx| {
@@ -1006,7 +1105,9 @@ impl Vim {
 
             if editor.is_focused(window) {
                 cx.defer_in(window, |vim, window, cx| {
-                    vim.focused(false, window, cx);
+                    VimGlobals::with_input(vim.input.clone(), cx, |cx| {
+                        vim.focused(false, window, cx)
+                    });
                 })
             }
         })
@@ -1040,14 +1141,87 @@ impl Vim {
         cx: &mut Context<Vim>,
         f: impl Fn(&mut Vim, &A, &mut Window, &mut Context<Vim>) + 'static,
     ) {
-        let subscription = editor.register_action(cx.listener(move |vim, action, window, cx| {
-            if !Vim::globals(cx).dot_replaying {
-                if vim.status_label.take().is_some() {
-                    cx.notify();
+        let listener = cx.listener(move |vim, action: &A, window, cx| {
+            VimGlobals::with_input(vim.input.clone(), cx, |cx| {
+                if !Vim::globals(cx).is_dot_replaying() {
+                    if vim.status_label.take().is_some() {
+                        cx.notify();
+                    }
                 }
-            }
-            f(vim, action, window, cx);
-        }));
+                if vim
+                    .editor()
+                    .is_some_and(|editor| window.is_key_dispatching_to(&editor.focus_handle(cx)))
+                {
+                    Vim::globals(cx).submit_macro_action(action);
+                }
+                f(vim, action, window, cx);
+            });
+        });
+        let vim = cx.weak_entity();
+        let origin = vim.clone();
+        let listener = Rc::new(listener);
+        let subscription = editor.register_action_with_context(
+            move |cx| {
+                origin
+                    .read_with(cx, |vim, cx| {
+                        VimCommandContext::capture(vim.input.clone(), cx)
+                    })
+                    .ok()
+            },
+            move |command, action: &A, window, cx| {
+                let Some(command) = command else {
+                    return;
+                };
+                command.clone().run(cx, |cx| {
+                    let native = vim
+                        .read_with(cx, |vim, cx| {
+                            Some((vim.editor()?, vim.action_register_access(action, cx)?))
+                        })
+                        .ok()
+                        .flatten();
+                    let Some((editor, required)) = native else {
+                        listener(action, window, cx);
+                        return;
+                    };
+                    let action = action.boxed_clone();
+                    let listener = listener.clone();
+                    let continuation = move |window: &mut Window, cx: &mut App| {
+                        if let Some(action) = action.as_any().downcast_ref::<A>() {
+                            listener(action, window, cx);
+                        }
+                    };
+                    let continuation = match window.defer_current_action_dispatch(cx, continuation)
+                    {
+                        Ok(continuation) => continuation,
+                        Err(continuation) => Box::new(continuation),
+                    };
+                    let continuation = Rc::new(RefCell::new(Some(continuation)));
+                    let vim = vim.clone();
+                    let complete = move |result, window: &mut Window, cx: &mut App| {
+                        command.run(cx, |cx| match result {
+                            Ok(()) => {
+                                if let Some(continuation) = continuation.borrow_mut().take() {
+                                    continuation(window, cx);
+                                }
+                            }
+                            Err(error) => {
+                                continuation.borrow_mut().take();
+                                vim.update(cx, |vim, cx| vim.reject_input(error, window, cx))
+                                    .ok();
+                            }
+                        });
+                    };
+                    let admission = editor.update(cx, |editor, cx| {
+                        editor.defer_shared_input(required, complete.clone(), window, cx)
+                    });
+                    match admission {
+                        Ok(Some(scope)) => scope.run(cx, |cx| complete(Ok(()), window, cx)),
+                        Ok(None) => {}
+                        Err(error) => complete(Err(error), window, cx),
+                    }
+                });
+            },
+        );
         cx.on_release(|_, _| drop(subscription)).detach();
     }
 
@@ -1085,6 +1259,42 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        VimGlobals::with_input(self.input.clone(), cx, |cx| {
+            Vim::globals(cx).observe_macro_action(keystroke_event.action.as_deref());
+        });
+        let event = KeystrokeEvent {
+            keystroke: keystroke_event.keystroke.clone(),
+            input_preference: keystroke_event.input_preference,
+            action: keystroke_event
+                .action
+                .as_ref()
+                .map(|action| action.boxed_clone()),
+            context_stack: keystroke_event.context_stack.clone(),
+        };
+        let pending_keystrokes = window.has_pending_keystrokes();
+        if self.defer_input(
+            move |vim, window, cx| {
+                vim.observe_keystroke_ready(&event, pending_keystrokes, window, cx);
+            },
+            cx,
+        ) {
+            return;
+        }
+        VimGlobals::with_input(self.input.clone(), cx, |cx| {
+            self.observe_keystroke_ready(keystroke_event, pending_keystrokes, window, cx);
+        });
+    }
+
+    fn observe_keystroke_ready(
+        &mut self,
+        keystroke_event: &KeystrokeEvent,
+        pending_keystrokes: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(action) = keystroke_event.action.as_ref() {
+            Vim::globals(cx).observe_action(action.boxed_clone());
+        }
         if self.exit_temporary_mode {
             self.exit_temporary_mode = false;
             // Don't switch to insert mode if the action is temporary_normal.
@@ -1100,8 +1310,7 @@ impl Vim {
             if action.name().starts_with("vim::") {
                 return;
             }
-        } else if window.has_pending_keystrokes() || keystroke_event.keystroke.is_ime_in_progress()
-        {
+        } else if pending_keystrokes || keystroke_event.keystroke.is_ime_in_progress() {
             return;
         }
 
@@ -1145,20 +1354,25 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            EditorEvent::Focused => self.focused(true, window, cx),
-            EditorEvent::Blurred => self.blurred(window, cx),
+        VimGlobals::with_input(self.input.clone(), cx, |cx| match event {
             EditorEvent::SelectionsChanged { local: true } => {
                 self.local_selections_changed(window, cx);
             }
             EditorEvent::InputIgnored { text } => {
-                self.input_ignored(text.clone(), window, cx);
-                Vim::globals(cx).observe_insertion(text, None)
+                let execution = Vim::globals(cx).input_execution();
+                VimGlobals::with_execution(execution, cx, |cx| {
+                    self.input_ignored(text.clone(), window, cx);
+                });
             }
             EditorEvent::InputHandled {
                 text,
                 utf16_range_to_replace: range_to_replace,
-            } => Vim::globals(cx).observe_insertion(text, range_to_replace.clone()),
+            } => {
+                let execution = Vim::globals(cx).input_execution();
+                VimGlobals::with_execution(execution, cx, |cx| {
+                    self.observe_insertion_after_input(text.clone(), range_to_replace.clone(), cx);
+                });
+            }
             EditorEvent::TransactionBegun { transaction_id } => {
                 self.transaction_begun(*transaction_id, window, cx)
             }
@@ -1182,7 +1396,7 @@ impl Vim {
                 });
             }
             _ => {}
-        }
+        });
     }
 
     fn push_operator(&mut self, operator: Operator, window: &mut Window, cx: &mut Context<Self>) {
@@ -1209,6 +1423,48 @@ impl Vim {
         &mut self,
         mode: Mode,
         leave_selections: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_geometry(
+            move |vim, window, cx| {
+                let block_selections = if !leave_selections
+                    && vim.mode != Mode::VisualBlock
+                    && vim.mode.is_visual()
+                    && mode == Mode::VisualBlock
+                {
+                    vim.update_editor(cx, |vim, editor, cx| {
+                        vim.plan_visual_block_motion(
+                            true,
+                            editor,
+                            (
+                                *editor.selections.newest_anchor(),
+                                *editor.selections.oldest_anchor(),
+                            ),
+                            window,
+                            cx,
+                            &mut |_, point, goal| Ok(Some((point, goal))),
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+                } else {
+                    None
+                };
+                Ok(Box::new(move |vim, window, cx| {
+                    vim.switch_mode_ready(mode, leave_selections, block_selections, window, cx);
+                }))
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn switch_mode_ready(
+        &mut self,
+        mode: Mode,
+        leave_selections: bool,
+        block_selections: Option<Vec<Selection<Point>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1287,12 +1543,7 @@ impl Vim {
 
         // Adjust selections
         self.update_editor(cx, |vim, editor, cx| {
-            if last_mode != Mode::VisualBlock && last_mode.is_visual() && mode == Mode::VisualBlock
-            {
-                vim.visual_block_motion(true, editor, window, cx, &mut |_, point, goal| {
-                    Some((point, goal))
-                })
-            }
+            Self::apply_visual_block_motion(editor, block_selections, window, cx);
             if (last_mode == Mode::Insert || last_mode == Mode::Replace)
                 && let Some(prior_tx) = prior_tx
             {
@@ -1362,14 +1613,18 @@ impl Vim {
                         }
                     }
                 });
-            })
+            });
         });
     }
 
     pub fn take_count(cx: &mut App) -> Option<usize> {
         let global_state = cx.global_mut::<VimGlobals>();
-        if global_state.dot_replaying {
-            return global_state.recorded_count;
+        if let Some(execution) = global_state
+            .execution
+            .as_ref()
+            .filter(|execution| execution.dot)
+        {
+            return execution.count;
         }
 
         let count = if global_state.post_count.is_none() && global_state.pre_count.is_none() {
@@ -1387,16 +1642,34 @@ impl Vim {
         count
     }
 
+    fn peek_count(cx: &App) -> Option<usize> {
+        let globals = cx.global::<VimGlobals>();
+        if let Some(execution) = globals.execution.as_ref().filter(|execution| execution.dot) {
+            execution.count
+        } else if globals.post_count.is_none() && globals.pre_count.is_none() {
+            None
+        } else {
+            Some(globals.post_count.unwrap_or(1) * globals.pre_count.unwrap_or(1))
+        }
+    }
+
     pub fn take_forced_motion(cx: &mut App) -> bool {
         let global_state = cx.global_mut::<VimGlobals>();
-        let forced_motion = global_state.forced_motion;
+        let forced_motion = global_state.forced_motion();
         global_state.forced_motion = false;
+        if let Some(execution) = &mut global_state.execution {
+            execution.forced_motion = Some(false);
+        }
         forced_motion
     }
 
     pub fn cursor_shape(&self, cx: &App) -> CursorShape {
+        self.cursor_shape_for_mode(self.mode, cx)
+    }
+
+    fn cursor_shape_for_mode(&self, mode: Mode, cx: &App) -> CursorShape {
         let cursor_shape = VimSettings::get_global(cx).cursor_shape;
-        match self.mode {
+        match mode {
             Mode::Normal => {
                 if let Some(operator) = self.operator_stack.last() {
                     match operator {
@@ -1409,7 +1682,7 @@ impl Vim {
                         | Operator::FindBackward { .. }
                         | Operator::Mark
                         | Operator::Jump { .. }
-                        | Operator::Register
+                        | Operator::Register { .. }
                         | Operator::RecordRegister
                         | Operator::ReplayRegister => CursorShape::Block,
 
@@ -1495,8 +1768,9 @@ impl Vim {
         let mut operator_id = "none";
 
         let active_operator = self.active_operator();
-        if active_operator.is_none() && cx.global::<VimGlobals>().pre_count.is_some()
-            || active_operator.is_some() && cx.global::<VimGlobals>().post_count.is_some()
+        let (pre_count, post_count) = self.input_counts(cx);
+        if active_operator.is_none() && pre_count.is_some()
+            || active_operator.is_some() && post_count.is_some()
         {
             context.add("VimCount");
         }
@@ -1548,7 +1822,22 @@ impl Vim {
         context.set("vim_operator", operator_id);
     }
 
-    fn focused(&mut self, preserve_selection: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn input_counts(&self, cx: &App) -> (Option<usize>, Option<usize>) {
+        let globals = cx.global::<VimGlobals>();
+        if Rc::ptr_eq(&self.input, &globals.input) {
+            (globals.pre_count, globals.post_count)
+        } else {
+            let input = self.input.borrow();
+            (input.command.pre_count, input.command.post_count)
+        }
+    }
+
+    fn focus_selections(
+        &mut self,
+        preserve_selection: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // If editor gains focus while search bar is still open (not dismissed),
         // the user has explicitly navigated away - clear prior_selections so we
         // don't restore to the old position if they later dismiss the search.
@@ -1597,7 +1886,15 @@ impl Vim {
                 });
             }
         }
+    }
 
+    fn focused(&mut self, preserve_selection: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.defer_focus_input(
+            move |vim, window, cx| vim.focus_selections(preserve_selection, window, cx),
+            cx,
+        ) {
+            self.focus_selections(preserve_selection, window, cx);
+        }
         cx.emit(VimEvent::Focused);
         self.sync_vim_settings(window, cx);
 
@@ -1623,23 +1920,338 @@ impl Vim {
             }
         }
         Vim::globals(cx).focused_vim = Some(cx.entity().downgrade());
+        Vim::globals(cx).focus_input(self.input.clone());
     }
 
     fn blurred(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_focus_input(Self::finish_blur, cx) {
+            self.sync_blurred_cursor(window, cx);
+        } else {
+            self.finish_blur(window, cx);
+        }
+        Vim::globals(cx).blur_input(&self.input);
+    }
+
+    fn finish_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_recording_immediately(NormalBefore.boxed_clone(), cx);
         self.store_visual_marks(window, cx);
         self.clear_operator(window, cx);
+        self.sync_blurred_cursor(window, cx);
+    }
+
+    fn sync_blurred_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.update_editor(cx, |vim, editor, cx| {
-            if vim.cursor_shape(cx) == CursorShape::Block {
+            if (!window.is_window_active() || !editor.focus_handle(cx).is_focused(window))
+                && vim.cursor_shape(cx) == CursorShape::Block
+            {
                 editor.set_cursor_shape(CursorShape::Hollow, cx);
             }
         });
+    }
+
+    fn defer_focus_input(
+        &mut self,
+        continuation: impl FnOnce(&mut Vim, &mut Window, &mut Context<Vim>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let vim = cx.weak_entity();
+        let input = self.input.clone();
+        self.update_editor(cx, |_, editor, _| {
+            editor.defer_external_input_after_pending(move |window, cx| {
+                VimGlobals::with_input(input, cx, |cx| {
+                    vim.update(cx, |vim, cx| continuation(vim, window, cx)).ok();
+                });
+            })
+        })
+        .unwrap_or(true)
     }
 
     fn cursor_shape_changed(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.update_editor(cx, |vim, editor, cx| {
             editor.set_cursor_shape(vim.cursor_shape(cx), cx);
         });
+    }
+
+    fn action_register_access(&self, action: &dyn Action, cx: &App) -> Option<NativeInput> {
+        let action = action.as_any();
+        if action.is::<editor::actions::Paste>() {
+            return Some(VimGlobals::native_register_input(
+                '+',
+                ClipboardReadMode::Contents,
+            ));
+        }
+        if let Some(action) = action.downcast_ref::<command::WithRange>() {
+            return action.register_access(self, cx);
+        }
+        if let Some(action) = action.downcast_ref::<VimPaste>() {
+            let read = VimGlobals::register_read_access(self.selected_register, cx);
+            if self.mode.is_visual() && !action.preserve_clipboard {
+                let mut required = read.unwrap_or_default();
+                let write = VimGlobals::register_write_access(None, false, cx).unwrap_or_default();
+                required.clipboard = required.clipboard.or(write.clipboard);
+                return Some(required);
+            }
+            return read;
+        }
+        if action.is::<helix::HelixPaste>() {
+            return VimGlobals::register_read_access(self.selected_register, cx);
+        }
+        let is_yank = action.is::<normal::YankLine>()
+            || action.is::<normal::YankToEndOfLine>()
+            || action.is::<visual::VisualYank>()
+            || action.is::<visual::VisualYankLine>()
+            || action.is::<helix::HelixYank>()
+            || action.is::<command::YankCommand>();
+        if is_yank
+            || action.is::<normal::DeleteLeft>()
+            || action.is::<normal::DeleteRight>()
+            || action.is::<normal::HelixDelete>()
+            || action.is::<normal::ChangeToEndOfLine>()
+            || action.is::<normal::DeleteToEndOfLine>()
+            || action.is::<normal::substitute::Substitute>()
+            || action.is::<normal::substitute::SubstituteLine>()
+            || action.is::<visual::VisualDelete>()
+            || action.is::<visual::VisualDeleteLine>()
+            || action.is::<helix::HelixSubstitute>()
+        {
+            return VimGlobals::register_write_access(self.selected_register, is_yank, cx);
+        }
+        None
+    }
+
+    fn operator_register_access(&self, cx: &App) -> Option<NativeInput> {
+        if !matches!(
+            self.mode,
+            Mode::Normal | Mode::Insert | Mode::Replace | Mode::HelixNormal
+        ) {
+            return None;
+        }
+        let mut operators = self.operator_stack.iter().rev();
+        let operator = match operators.next() {
+            Some(
+                Operator::Object { .. }
+                | Operator::FindForward { .. }
+                | Operator::FindBackward { .. }
+                | Operator::Sneak { .. }
+                | Operator::SneakBackward { .. },
+            ) => operators.next(),
+            operator => operator,
+        };
+        match operator {
+            Some(Operator::Delete | Operator::Change) => {
+                VimGlobals::register_write_access(self.selected_register, false, cx)
+            }
+            Some(Operator::Yank) => {
+                VimGlobals::register_write_access(self.selected_register, true, cx)
+            }
+            Some(Operator::ReplaceWithRegister) => {
+                VimGlobals::register_read_access(self.selected_register, cx)
+            }
+            _ => None,
+        }
+    }
+
+    fn with_shared_input(
+        &mut self,
+        required: NativeInput,
+        continuation: impl FnOnce(&mut Vim, &mut Window, &mut Context<Vim>) + Clone + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let vim = cx.weak_entity();
+        let command = VimCommandContext::capture(self.input.clone(), cx);
+        let deferred = continuation.clone();
+        let deferred_command = command.clone();
+        let admission = self.update_editor(cx, |_, editor, cx| {
+            editor.defer_shared_input(
+                required,
+                move |result, window, cx| {
+                    deferred_command.run(cx, |cx| {
+                        vim.update(cx, |vim, cx| match result {
+                            Ok(()) => deferred(vim, window, cx),
+                            Err(error) => vim.reject_input(error, window, cx),
+                        })
+                        .ok();
+                    });
+                },
+                window,
+                cx,
+            )
+        });
+        command.run(cx, |cx| match admission {
+            Some(Ok(Some(scope))) => scope.run(cx, |cx| continuation(self, window, cx)),
+            Some(Err(error)) => self.reject_input(error, window, cx),
+            Some(Ok(None)) | None => {}
+        });
+    }
+
+    fn reject_input(&mut self, error: anyhow::Error, window: &mut Window, cx: &mut Context<Self>) {
+        let operator = self.active_operator();
+        let globals = Vim::globals(cx);
+        let preserves_edit_session = matches!(self.mode, Mode::Insert | Mode::Replace)
+            && !globals.stop_recording_after_next_action
+            && globals.execution.is_none();
+        if preserves_edit_session && let Some(Operator::Register { recording }) = operator {
+            globals.discard_recorded_action(recording, &PushRegister);
+        }
+        if !preserves_edit_session {
+            globals.abort_recording();
+            globals.pre_count = None;
+            globals.post_count = None;
+        }
+        if globals.execution.is_some() {
+            self.stop_replaying(cx);
+        }
+        self.clear_operator_state(window, cx);
+        self.exit_temporary_mode = false;
+        self.exit_temporary_normal(window, cx);
+        self.update_editor(cx, |vim, _, cx| {
+            vim.set_status_label(format!("{error:#}"), cx)
+        });
+        cx.stop_propagation();
+    }
+
+    fn defer_input(
+        &mut self,
+        continuation: impl FnOnce(&mut Vim, &mut Window, &mut Context<Vim>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let vim = cx.weak_entity();
+        let command = VimCommandContext::capture(self.input.clone(), cx);
+        self.update_editor(cx, |_, editor, cx| {
+            editor.defer_external_input(
+                move |window, cx| {
+                    command.run(cx, |cx| {
+                        vim.update(cx, |vim, cx| continuation(vim, window, cx)).ok();
+                    });
+                },
+                cx,
+            )
+        })
+        .unwrap_or(true)
+    }
+
+    fn observe_insertion_after_input(
+        &mut self,
+        text: Arc<str>,
+        range_to_replace: Option<Range<isize>>,
+        cx: &mut Context<Self>,
+    ) {
+        let deferred_text = text.clone();
+        let deferred_range = range_to_replace.clone();
+        if self.defer_input(
+            move |_, _, cx| {
+                Vim::globals(cx).observe_insertion(&deferred_text, deferred_range);
+            },
+            cx,
+        ) {
+            return;
+        }
+        Vim::globals(cx).observe_insertion(&text, range_to_replace);
+    }
+
+    fn with_geometry(
+        &mut self,
+        plan: impl Fn(
+            &mut Vim,
+            &mut Window,
+            &mut Context<Vim>,
+        ) -> Result<GeometryCommit, PendingRowGeometry>
+        + Clone
+        + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let retry = plan.clone();
+        if self.defer_input(
+            move |vim, window, cx| vim.with_geometry(retry, window, cx),
+            cx,
+        ) {
+            return;
+        }
+        VimGlobals::with_input(self.input.clone(), cx, |cx| match plan(self, window, cx) {
+            Ok(commit) => commit(self, window, cx),
+            Err(pending) => {
+                let vim = cx.weak_entity();
+                let command = VimCommandContext::capture(self.input.clone(), cx);
+                let continuation = move |window: &mut Window, cx: &mut App| {
+                    vim.update(cx, |vim, cx| vim.with_geometry(plan, window, cx))
+                        .ok();
+                };
+                self.update_editor(cx, |_, editor, cx| {
+                    editor.defer_external_geometry(
+                        pending,
+                        move |window, cx| {
+                            command.run(cx, |cx| continuation(window, cx));
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            }
+        });
+    }
+
+    fn plan_selections<T>(
+        &mut self,
+        clip_at_line_ends: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        mut plan: impl FnMut(
+            &DisplaySnapshot,
+            &TextLayoutDetails,
+            Selection<DisplayPoint>,
+        ) -> Result<T, PendingRowGeometry>,
+    ) -> Result<Vec<T>, PendingRowGeometry> {
+        self.update_editor(cx, |_, editor, cx| {
+            let snapshot = Self::geometry_snapshot(editor, clip_at_line_ends, cx);
+            let details = editor.text_layout_details(window, cx);
+            editor
+                .selections
+                .all_display(&snapshot)
+                .into_iter()
+                .map(|selection| plan(&snapshot, &details, selection))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn geometry_snapshot(
+        editor: &Editor,
+        clip_at_line_ends: Option<bool>,
+        cx: &mut App,
+    ) -> DisplaySnapshot {
+        editor.display_map.update(cx, |map, cx| {
+            let previous = map.clip_at_line_ends;
+            if let Some(clip_at_line_ends) = clip_at_line_ends {
+                map.clip_at_line_ends = clip_at_line_ends;
+            }
+            let snapshot = map.snapshot(cx);
+            map.clip_at_line_ends = previous;
+            snapshot
+        })
+    }
+
+    fn expanded_motion(
+        &mut self,
+        motion: &Motion,
+        times: Option<usize>,
+        forced_motion: bool,
+        clip_at_line_ends: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<MotionSelections, PendingRowGeometry> {
+        let selections = self.plan_selections(
+            clip_at_line_ends,
+            window,
+            cx,
+            |map, details, mut selection| {
+                let kind =
+                    motion.expand_selection(map, &mut selection, times, details, forced_motion)?;
+                Ok((selection.id, (selection, kind)))
+            },
+        )?;
+        Ok(MotionSelections(selections.into_iter().collect()))
     }
 
     fn update_editor<S>(
@@ -1667,7 +2279,7 @@ impl Vim {
     /// will replay the action.
     pub fn start_recording(&mut self, cx: &mut Context<Self>) {
         Vim::update_globals(cx, |globals, cx| {
-            if !globals.dot_replaying {
+            if !globals.is_dot_replaying() {
                 globals.dot_recording = true;
                 globals.recording_actions = Default::default();
                 globals.recording_count = None;
@@ -1685,7 +2297,7 @@ impl Vim {
                 });
 
                 if let Some((oldest, newest)) = selections {
-                    globals.recorded_selection = match self.mode {
+                    globals.recording_selection = match self.mode {
                         Mode::Visual if newest.end.row == newest.start.row => {
                             RecordedSelection::SingleLine {
                                 cols: newest.end.column - newest.start.column,
@@ -1705,7 +2317,7 @@ impl Vim {
                         _ => RecordedSelection::None,
                     }
                 } else {
-                    globals.recorded_selection = RecordedSelection::None;
+                    globals.recording_selection = RecordedSelection::None;
                 }
             }
         })
@@ -1713,6 +2325,9 @@ impl Vim {
 
     pub fn stop_replaying(&mut self, cx: &mut Context<Self>) {
         let globals = Vim::globals(cx);
+        if !globals.execution_is_current() {
+            return;
+        }
         globals.dot_replaying = false;
         if let Some(replayer) = globals.replayer.take() {
             replayer.stop();
@@ -1740,10 +2355,7 @@ impl Vim {
             globals
                 .recording_actions
                 .push(ReplayableAction::Action(action.boxed_clone()));
-            globals.recorded_actions = mem::take(&mut globals.recording_actions);
-            globals.recorded_count = globals.recording_count.take();
-            globals.dot_recording = false;
-            globals.stop_recording_after_next_action = false;
+            globals.finish_recording();
         }
         self.exit_temporary_mode = self.temp_mode;
     }
@@ -1801,10 +2413,14 @@ impl Vim {
     }
 
     fn clear_operator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        Vim::take_count(cx);
+        self.clear_operator_state(window, cx);
+    }
+
+    fn clear_operator_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.active_operator(), Some(Operator::HelixJump { .. })) {
             self.clear_helix_jump_ui(window, cx);
         }
-        Vim::take_count(cx);
         Vim::take_forced_motion(cx);
         self.selected_register.take();
         self.operator_stack.clear();
@@ -1918,17 +2534,21 @@ impl Vim {
                 });
             }
             HelixJumpBehaviour::Extend => {
-                let buffer = editor.buffer().read(cx).snapshot(cx);
-                let word_end = Vim::jump_target_word_end(&buffer, candidate.range.end);
+                let mut word_end = None;
                 editor.change_selections(Default::default(), window, cx, |s| {
                     s.move_with(&mut |map, selection| {
                         let word_start = candidate.range.start.to_display_point(map);
-                        let word_end = word_end.to_display_point(map);
                         let tail = selection.tail();
 
                         if word_start >= tail {
                             // Jumping forward: extend head to end of target word
-                            selection.set_head(word_end, SelectionGoal::None);
+                            let word_end = *word_end.get_or_insert_with(|| {
+                                Vim::jump_target_word_end(
+                                    map.buffer_snapshot(),
+                                    candidate.range.end,
+                                )
+                            });
+                            selection.set_head(word_end.to_display_point(map), SelectionGoal::None);
                         } else {
                             // Jumping backward: extend backward while keeping current extent
                             // Use current end as tail to preserve the selection
@@ -2054,10 +2674,41 @@ impl Vim {
     }
 
     fn input_ignored(&mut self, text: Arc<str>, window: &mut Window, cx: &mut Context<Self>) {
+        let deferred_text = text.clone();
+        if self.defer_input(
+            move |vim, window, cx| vim.input_ignored(deferred_text, window, cx),
+            cx,
+        ) {
+            return;
+        }
         if text.is_empty() {
             return;
         }
+        let required = match self.active_operator() {
+            Some(Operator::Register { .. }) if self.mode == Mode::Insert => {
+                VimGlobals::register_read_access(text.chars().next(), cx)
+            }
 
+            Some(
+                Operator::FindForward { .. }
+                | Operator::FindBackward { .. }
+                | Operator::Sneak { .. }
+                | Operator::SneakBackward { .. },
+            ) => self.operator_register_access(cx),
+            _ => None,
+        };
+        let continuation = move |vim: &mut Vim, window: &mut Window, cx: &mut Context<Vim>| {
+            vim.input_ignored_ready(text.clone(), window, cx);
+            vim.observe_insertion_after_input(text, None, cx);
+        };
+        if let Some(required) = required {
+            self.with_shared_input(required, continuation, window, cx);
+        } else {
+            continuation(self, window, cx);
+        }
+    }
+
+    fn input_ignored_ready(&mut self, text: Arc<str>, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_operator() {
             Some(Operator::FindForward { before, multiline }) => {
                 let find = Motion::FindForward {
@@ -2152,12 +2803,10 @@ impl Vim {
                 Mode::Normal => {
                     if let Some(target) = target {
                         self.add_surrounds(text, target, window, cx);
-                        self.clear_operator(window, cx);
                     }
                 }
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                     self.add_surrounds(text, SurroundsType::Selection, window, cx);
-                    self.clear_operator(window, cx);
                 }
                 _ => self.clear_operator(window, cx),
             },
@@ -2242,12 +2891,10 @@ impl Vim {
             Some(Operator::ReplayRegister) => {
                 self.replay_register(text.chars().next().unwrap(), window, cx)
             }
-            Some(Operator::Register) => match self.mode {
+            Some(Operator::Register { .. }) => match self.mode {
                 Mode::Insert => {
-                    self.update_editor(cx, |_, editor, cx| {
-                        if let Some(register) = Vim::update_globals(cx, |globals, cx| {
-                            globals.read_register(text.chars().next(), Some(editor), cx)
-                        }) {
+                    self.update_editor(cx, |vim, editor, cx| {
+                        if let Some(register) = vim.read_register(text.chars().next(), editor, cx) {
                             editor.do_paste(
                                 &register.text.to_string(),
                                 register.clipboard_selections,
@@ -2321,6 +2968,35 @@ impl Vim {
         editor.set_cursor_offset_on_selection(state.cursor_offset_on_selection);
         editor.selections.set_line_mode(state.line_mode);
         editor.set_edit_predictions_hidden_for_vim_mode(state.hide_edit_predictions, window, cx);
+    }
+
+    fn read_register(
+        &mut self,
+        register: Option<char>,
+        editor: &mut Editor,
+        cx: &mut Context<Editor>,
+    ) -> Option<Register> {
+        match Vim::update_globals(cx, |globals, cx| {
+            globals.read_register(register, Some(editor), cx)
+        }) {
+            Ok(Some(content)) if !content.text.is_empty() => Some(content),
+            Ok(_) => {
+                self.set_status_label(
+                    format!("Nothing in register {}", register.unwrap_or('"')),
+                    cx,
+                );
+                None
+            }
+            Err(error) => {
+                Vim::update_globals(cx, |globals, _| {
+                    if globals.stop_recording_after_next_action {
+                        globals.abort_recording();
+                    }
+                });
+                self.set_status_label(format!("{error:#}"), cx);
+                None
+            }
+        }
     }
 
     fn set_status_label(&mut self, label: impl Into<SharedString>, cx: &mut Context<Editor>) {

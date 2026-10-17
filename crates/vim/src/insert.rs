@@ -47,7 +47,7 @@ impl Vim {
         let count = Vim::take_count(cx).unwrap_or(1);
         Vim::take_forced_motion(cx);
         self.stop_recording_immediately(action.boxed_clone(), cx);
-        if count <= 1 || Vim::globals(cx).dot_replaying {
+        if count <= 1 || Vim::globals(cx).is_dot_replaying() {
             self.create_mark("^".into(), window, cx);
 
             if HelixModeSetting::get_global(cx).0 {
