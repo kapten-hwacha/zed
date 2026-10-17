@@ -12,7 +12,7 @@ use gpui::{Entity, TestAppContext, UpdateGlobal as _};
 use language::{
     Buffer, CodeLabel, DiagnosticSourceKind, FakeLspAdapter, HighlightId, LocalFile, rust_lang,
 };
-use lsp::{LanguageServerId, LanguageServerName, Uri};
+use lsp::{LanguageServerId, LanguageServerName, LanguageServerSelector, Uri};
 use parking_lot::Mutex;
 use project::{
     DiagnosticSummary, Event, Project,
@@ -27,6 +27,320 @@ use unindent::Unindent;
 use util::{path, rel_path::rel_path};
 
 use crate::init_test;
+
+#[gpui::test]
+async fn test_cli_environment_changes_restart_language_servers(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store
+            .set_user_settings(
+                &json!({
+                    "languages": {
+                        "Rust": { "language_servers": ["the-fake-language-server"] }
+                    },
+                    "lsp": {
+                        "the-fake-language-server": {
+                            "binary": {
+                                "path": path!("/fake/lsp/server"),
+                                "env": { "BINARY_ENV": "configured" }
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                cx,
+            )
+            .unwrap();
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    let project = Project::test(fs, [Path::new(path!("/dir"))], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+    let mut disabled_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "disabled-server",
+            ..FakeLspAdapter::default()
+        },
+    );
+    let (buffer, handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let environment = project.read_with(cx, |project, _| project.environment().clone());
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let mut server = fake_servers.next().await.unwrap();
+    let document = server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await
+        .text_document;
+    assert_eq!(
+        server.binary.env,
+        Some(HashMap::from_iter([(
+            "BINARY_ENV".to_owned(),
+            "configured".to_owned()
+        )]))
+    );
+    let mut server_id = server.server.server_id();
+
+    for cli_environment in [
+        HashMap::from_iter([
+            ("CLI_ENV".to_owned(), "first".to_owned()),
+            ("REMOVED_ENV".to_owned(), "old".to_owned()),
+            ("BINARY_ENV".to_owned(), "cli".to_owned()),
+        ]),
+        HashMap::from_iter([("CLI_ENV".to_owned(), "second".to_owned())]),
+        HashMap::default(),
+    ] {
+        let mut expected_environment = cli_environment.clone();
+        expected_environment.insert("ZED_ENVIRONMENT".to_owned(), "cli".to_owned());
+        expected_environment.insert("BINARY_ENV".to_owned(), "configured".to_owned());
+        environment.update(cx, |environment, cx| {
+            environment.set_cli_environment(cli_environment.clone(), cx);
+        });
+        cx.run_until_parked();
+        let mut restarted_server = fake_servers
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("changed CLI environment must restart the server");
+        assert_ne!(restarted_server.server.server_id(), server_id);
+        assert_eq!(restarted_server.binary.env, Some(expected_environment));
+        assert_eq!(
+            restarted_server
+                .receive_notification::<lsp::notification::DidOpenTextDocument>()
+                .await
+                .text_document,
+            document
+        );
+        server_id = restarted_server.server.server_id();
+        environment.update(cx, |environment, cx| {
+            environment.set_cli_environment(cli_environment, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fake_servers
+                .next()
+                .now_or_never()
+                .flatten()
+                .map(|server| server.server.server_id()),
+            None
+        );
+        lsp_store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .language_server_statuses()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>(),
+                vec![server_id]
+            );
+        });
+    }
+
+    cx.update(|_| drop(handle));
+    environment.update(cx, |environment, cx| {
+        environment.set_cli_environment(
+            HashMap::from_iter([("CLI_ENV".to_owned(), "idle".to_owned())]),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    lsp_store.read_with(cx, |store, _| {
+        assert_eq!(store.language_server_statuses().count(), 0);
+    });
+    let _handle = project.update(cx, |project, cx| {
+        project.register_buffer_with_language_servers(&buffer, cx)
+    });
+    let server = fake_servers.next().await.unwrap();
+    assert_eq!(
+        server.binary.env,
+        Some(HashMap::from_iter([
+            ("CLI_ENV".to_owned(), "idle".to_owned()),
+            ("ZED_ENVIRONMENT".to_owned(), "cli".to_owned()),
+            ("BINARY_ENV".to_owned(), "configured".to_owned()),
+        ]))
+    );
+    lsp_store
+        .update(cx, |store, cx| {
+            store.stop_language_servers_for_buffers(vec![buffer.clone()], HashSet::default(), cx)
+        })
+        .await
+        .unwrap();
+    environment.update(cx, |environment, cx| {
+        environment.set_cli_environment(HashMap::default(), cx);
+    });
+    cx.run_until_parked();
+    lsp_store.read_with(cx, |store, _| {
+        assert_eq!(store.language_server_statuses().count(), 0);
+    });
+    for servers in [&mut fake_servers, &mut disabled_servers] {
+        assert_eq!(
+            servers
+                .next()
+                .now_or_never()
+                .flatten()
+                .map(|server| server.server.name()),
+            None
+        );
+    }
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![buffer],
+            HashSet::from_iter([LanguageServerSelector::Name(LanguageServerName::from(
+                "the-fake-language-server",
+            ))]),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let mut server = fake_servers.next().now_or_never().flatten().unwrap();
+    assert_eq!(
+        server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document,
+        document
+    );
+    assert!(disabled_servers.next().now_or_never().is_none());
+}
+
+#[gpui::test]
+async fn test_cli_environment_and_manual_restart_preserve_invisible_buffer_origins(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/projects"),
+        json!({
+            "one": { "main.rs": "fn main() {}" },
+            "two": { "main.rs": "fn main() {}" },
+            "dependencies": { "one.rs": "pub fn one() {}", "two.rs": "pub fn two() {}" },
+        }),
+    )
+    .await;
+    let project = Project::test(
+        fs,
+        [
+            Path::new(path!("/projects/one")),
+            Path::new(path!("/projects/two")),
+        ],
+        cx,
+    )
+    .await;
+    let languages = project.read_with(cx, |project, _| project.languages().clone());
+    languages.add(rust_lang());
+    let mut servers = languages.register_fake_lsp("Rust", FakeLspAdapter::default());
+    let mut auxiliary_servers = languages.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "auxiliary-server",
+            ..FakeLspAdapter::default()
+        },
+    );
+    let mut expected = HashMap::default();
+    let mut handles = Vec::new();
+    for (root, dependency, text) in [
+        (
+            path!("/projects/one"),
+            path!("/projects/dependencies/one.rs"),
+            "pub fn one() {}",
+        ),
+        (
+            path!("/projects/two"),
+            path!("/projects/dependencies/two.rs"),
+            "pub fn two() {}",
+        ),
+    ] {
+        let (buffer, handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(Path::new(root).join("main.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let original_server = servers.next().await.unwrap();
+        auxiliary_servers.next().await.unwrap();
+        cx.run_until_parked();
+        let worktree_id = buffer.read_with(cx, |buffer, cx| buffer.file().unwrap().worktree_id(cx));
+        let uri = Uri::from_file_path(dependency).unwrap();
+        let dependency = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_via_lsp(
+                    uri.clone(),
+                    original_server.server.server_id(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        handles.push(project.update(cx, |project, cx| {
+            project.register_buffer_with_language_servers(&dependency, cx)
+        }));
+        cx.run_until_parked();
+        cx.update(|_| drop(handle));
+        expected.insert(worktree_id, (uri, Uri::from_file_path(root).unwrap(), text));
+    }
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    for automatic in [true, false] {
+        if automatic {
+            let environment = project.read_with(cx, |project, _| project.environment().clone());
+            environment.update(cx, |environment, cx| {
+                environment.set_cli_environment(
+                    HashMap::from_iter([("CLI_ENV".to_owned(), "updated".to_owned())]),
+                    cx,
+                );
+            });
+        } else {
+            lsp_store.update(cx, |store, cx| store.restart_all_language_servers(cx));
+        }
+        cx.run_until_parked();
+        let statuses = lsp_store.read_with(cx, |store, _| {
+            store
+                .language_server_statuses()
+                .map(|(id, status)| (id, status.worktree.unwrap()))
+                .collect::<HashMap<_, _>>()
+        });
+        assert_eq!(statuses.len(), expected.len() * 2);
+        for servers in [&mut servers, &mut auxiliary_servers] {
+            for _ in 0..expected.len() {
+                let mut server = servers
+                    .next()
+                    .now_or_never()
+                    .flatten()
+                    .expect("replacement server");
+                let worktree_id = statuses.get(&server.server.server_id()).unwrap();
+                let (uri, root, text) =
+                    expected.get(worktree_id).expect("original launch worktree");
+                assert_eq!(
+                    server
+                        .server
+                        .workspace_folders()
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    vec![root.clone()]
+                );
+                let document = server
+                    .receive_notification::<lsp::notification::DidOpenTextDocument>()
+                    .await
+                    .text_document;
+                assert_eq!(document.uri, *uri);
+                assert_eq!(document.text, *text);
+                assert!(
+                    server
+                        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+                        .now_or_never()
+                        .is_none()
+                );
+            }
+            assert!(servers.next().now_or_never().is_none());
+        }
+    }
+}
 
 #[gpui::test]
 async fn test_diagnostic_batches_skip_paths_without_worktrees(cx: &mut TestAppContext) {

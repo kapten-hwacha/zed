@@ -88,9 +88,13 @@ impl DisconnectedOverlay {
         .detach();
     }
 
-    fn handle_reconnect(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn finished(&mut self, cx: &mut Context<Self>) {
         self.finished = true;
         cx.emit(DismissEvent);
+    }
+
+    fn handle_reconnect(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.finished(cx);
 
         if let Host::RemoteServerProject(remote_connection_options, _) = &self.host {
             self.reconnect_to_remote_project(remote_connection_options.clone(), window, cx);
@@ -137,8 +141,7 @@ impl DisconnectedOverlay {
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        self.finished = true;
-        cx.emit(DismissEvent)
+        self.finished(cx);
     }
 }
 
