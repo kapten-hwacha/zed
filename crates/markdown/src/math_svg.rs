@@ -206,17 +206,17 @@ fn resolve_glyph_path<'a>(
     font_refs: &mut HashMap<FontId, (ab_glyph::FontRef<'a>, ratex_font_loader::OutlineSourceId)>,
 ) -> Option<String> {
     use ab_glyph::Font;
+    use std::collections::hash_map::Entry;
 
-    if !font_refs.contains_key(&font_id) {
-        if let Some((_, font_data, source_id)) =
-            fonts.iter_with_source().find(|(id, _, _)| **id == font_id)
-        {
-            if let Ok(font_ref) = ab_glyph::FontRef::try_from_slice(font_data) {
-                font_refs.insert(font_id, (font_ref, source_id));
-            }
+    let (font_ref, source_id) = match font_refs.entry(font_id) {
+        Entry::Occupied(e) => e.into_mut(),
+        Entry::Vacant(e) => {
+            let (_, font_data, source_id) =
+                fonts.iter_with_source().find(|(id, _, _)| **id == font_id)?;
+            let font_ref = ab_glyph::FontRef::try_from_slice(font_data).ok()?;
+            e.insert((font_ref, source_id))
         }
-    }
-    let (font_ref, source_id) = font_refs.get(&font_id)?;
+    };
 
     let glyph_id = font_ref.glyph_id(ch);
     if glyph_id.0 == 0 {
