@@ -56,6 +56,7 @@ jobs:
       - name: Build macOS Application Bundle (.dmg)
         run: |
           export CXXFLAGS="-stdlib=libc++"
+          echo "stable" > crates/zed/RELEASE_CHANNEL
           ./script/generate-licenses
           ./script/bundle-mac aarch64-apple-darwin
 
