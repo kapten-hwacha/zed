@@ -116,8 +116,9 @@ struct BufferFontSize(Pixels);
 
 impl Global for BufferFontSize {}
 
+/// In-memory override for the UI font size.
 #[derive(Default)]
-pub(crate) struct UiFontSize(Pixels);
+pub struct UiFontSize(Pixels);
 
 impl Global for UiFontSize {}
 

@@ -274,9 +274,23 @@ impl MathState {
             }
         }
 
-        let new_key_set: std::collections::HashSet<_> =
-            new_keys.iter().map(|(k, _)| k.clone()).collect();
-        self.cache.retain(|key, _| new_key_set.contains(key));
+        if self.cache.len() > 128 {
+            let new_key_set: std::collections::HashSet<_> =
+                new_keys.iter().map(|(k, _)| k.clone()).collect();
+            self.cache.retain(|key, _| new_key_set.contains(key));
+        }
+    }
+
+    pub(crate) fn find_fallback_render(&self, latex: &str) -> Option<(Arc<RenderImage>, f32, f32)> {
+        for (key, cached) in &self.cache {
+            if key.latex.as_ref() == latex {
+                if let Some(Ok((image, baseline_y))) = cached.rendered_data() {
+                    let font_size = f32::from_bits(key.font_size_bits);
+                    return Some((image, baseline_y, font_size));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -448,22 +462,52 @@ pub(crate) fn render_math_expression(
                     .into_any_element()
             }
         }
-        Some(Err(_)) | None => {
-            let label = if parsed.is_display {
-                format!("$${}$$", parsed.latex)
+        _ => {
+            if let Some((fallback_image, fallback_baseline_y, fallback_font_size)) =
+                math_state.find_fallback_render(&parsed.latex)
+            {
+                let scale = if fallback_font_size > 0.0 {
+                    font_size / fallback_font_size
+                } else {
+                    1.0
+                };
+                let scaled_size = fallback_image.size(0);
+                let w = px(scaled_size.width.0 as f32 * scale);
+                let h = px(scaled_size.height.0 as f32 * scale);
+                let baseline_y = fallback_baseline_y * scale;
+
+                if parsed.is_display {
+                    div()
+                        .flex()
+                        .w_full()
+                        .justify_center()
+                        .my_2()
+                        .child(gpui::img(fallback_image).w(w).h(h))
+                        .into_any_element()
+                } else {
+                    let baseline = text_baseline.unwrap_or(math_state.text_ascent);
+                    let shift = baseline - baseline_y - MATH_INLINE_OPTICAL_Y_OFFSET;
+                    div()
+                        .child(gpui::img(fallback_image).w(w).h(h).mt(px(shift)))
+                        .into_any_element()
+                }
             } else {
-                format!("${}$", parsed.latex)
-            };
-            if parsed.is_display {
-                div()
-                    .flex()
-                    .w_full()
-                    .justify_center()
-                    .my_2()
-                    .child(StyledText::new(label))
-                    .into_any_element()
-            } else {
-                div().child(StyledText::new(label)).into_any_element()
+                let label = if parsed.is_display {
+                    format!("$${}$$", parsed.latex)
+                } else {
+                    format!("${}$", parsed.latex)
+                };
+                if parsed.is_display {
+                    div()
+                        .flex()
+                        .w_full()
+                        .justify_center()
+                        .my_2()
+                        .child(StyledText::new(label))
+                        .into_any_element()
+                } else {
+                    div().child(StyledText::new(label)).into_any_element()
+                }
             }
         }
     }

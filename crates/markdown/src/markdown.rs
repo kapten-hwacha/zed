@@ -731,6 +731,28 @@ impl Markdown {
                     this.invalidate_math_cache(cx);
                 },
             ));
+            theme_subscriptions.push(cx.observe_global::<theme_settings::AgentUiFontSize>(
+                |this: &mut Self, cx| {
+                    this.invalidate_math_cache(cx);
+                },
+            ));
+            theme_subscriptions.push(cx.observe_global::<theme_settings::AgentBufferFontSize>(
+                |this: &mut Self, cx| {
+                    this.invalidate_math_cache(cx);
+                },
+            ));
+            theme_subscriptions.push(
+                cx.observe_global::<theme_settings::MarkdownPreviewFontSize>(
+                    |this: &mut Self, cx| {
+                        this.invalidate_math_cache(cx);
+                    },
+                ),
+            );
+            theme_subscriptions.push(cx.observe_global::<theme_settings::UiFontSize>(
+                |this: &mut Self, cx| {
+                    this.invalidate_math_cache(cx);
+                },
+            ));
         }
         let mut this = Self {
             source,
@@ -867,6 +889,24 @@ impl Markdown {
             self.math_state.retheme(text_color, cx);
         }
         cx.notify();
+    }
+
+    pub fn ensure_math_font_size(&mut self, base_font_size: f32, cx: &mut Context<Self>) {
+        if !self.options.render_math
+            || self.parsed_markdown.math_expressions.is_empty()
+            || base_font_size <= 0.0
+        {
+            return;
+        }
+
+        let target_font_size = base_font_size * crate::math::MATH_FONT_SCALE_FACTOR;
+        if (self.math_state.font_size() - target_font_size).abs() > 0.01 {
+            let parsed = self.parsed_markdown.clone();
+            let text_color = self.current_text_color(cx);
+            self.math_state
+                .update(&parsed, target_font_size, text_color, cx);
+            cx.notify();
+        }
     }
 
     pub(crate) fn is_mermaid_showing_code(&self, source_offset: usize) -> bool {
@@ -2772,8 +2812,16 @@ impl Element for MarkdownElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        self.markdown
-            .update(cx, |markdown, cx| markdown.ensure_parsed(cx));
+        let base_font_size = self
+            .style
+            .base_text_style
+            .font_size
+            .to_pixels(window.rem_size())
+            .as_f32();
+        self.markdown.update(cx, |markdown, cx| {
+            markdown.ensure_parsed(cx);
+            markdown.ensure_math_font_size(base_font_size, cx);
+        });
 
         let highlights = {
             let markdown = self.markdown.read(cx);
@@ -9123,6 +9171,83 @@ mod tests {
         assert_eq!(
             rendered.text_for_range(0..input.len()),
             "Heading with $s \\approx -3.51$ math"
+        );
+    }
+
+    #[gpui::test]
+    fn test_math_scales_when_chat_font_size_changes(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let input = "Formula $E = mc^2$ in chat";
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                input.to_string().into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_math: true,
+                    font: Some(MarkdownFont::Agent),
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let initial_font_size = markdown.read_with(cx, |m, _| m.math_state.font_size());
+        assert!(initial_font_size > 0.0);
+
+        // Adjust agent UI font size (simulating cmd-+ in chat)
+        cx.update(|cx| {
+            theme_settings::adjust_agent_ui_font_size(cx, |size| size + px(4.0));
+        });
+        cx.run_until_parked();
+
+        let updated_font_size = markdown.read_with(cx, |m, _| m.math_state.font_size());
+        assert!(
+            (updated_font_size - (initial_font_size + 4.0 * crate::math::MATH_FONT_SCALE_FACTOR))
+                .abs()
+                < 0.05,
+            "math font size must scale with agent UI font size: expected {}, got {}",
+            initial_font_size + 4.0 * crate::math::MATH_FONT_SCALE_FACTOR,
+            updated_font_size
+        );
+    }
+
+    #[gpui::test]
+    fn test_math_scales_when_element_font_size_changes(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let input = "Formula $E = mc^2$ scaled";
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                input.to_string().into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_math: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Render with custom larger font size in MarkdownStyle
+        let window_cx = cx.add_empty_window();
+        let mut custom_style = MarkdownStyle::default();
+        custom_style.base_text_style.font_size = px(28.0).into();
+        window_cx.draw(
+            gpui::point(px(0.0), px(0.0)),
+            gpui::size(px(600.0), px(600.0)),
+            |_, _| MarkdownElement::new(markdown.clone(), custom_style).into_any_element(),
+        );
+        cx.run_until_parked();
+
+        let updated_size = markdown.read_with(cx, |m, _| m.math_state.font_size());
+        assert!(
+            (updated_size - 28.0 * crate::math::MATH_FONT_SCALE_FACTOR).abs() < 0.05,
+            "math font size must update to match element font size: expected {}, got {}",
+            28.0 * crate::math::MATH_FONT_SCALE_FACTOR,
+            updated_size
         );
     }
 
