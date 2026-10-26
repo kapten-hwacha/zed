@@ -29,15 +29,28 @@ pub(crate) struct ParsedMarkdownMathExpression {
     pub(crate) font_scale: f32,
 }
 
-pub(crate) fn heading_level_font_scale(level: Option<HeadingLevel>) -> f32 {
-    match level {
-        Some(HeadingLevel::H1) => 1.875,
-        Some(HeadingLevel::H2) => 1.5,
-        Some(HeadingLevel::H3) => 1.25,
-        Some(HeadingLevel::H4) => 1.125,
-        Some(HeadingLevel::H5) => 1.0,
-        Some(HeadingLevel::H6) => 0.875,
-        None => 1.0,
+pub(crate) fn heading_level_font_scale(
+    level: Option<HeadingLevel>,
+    font: Option<crate::MarkdownFont>,
+) -> f32 {
+    let Some(level) = level else { return 1.0 };
+    match font {
+        Some(crate::MarkdownFont::Agent) => match level {
+            HeadingLevel::H1 => 1.15,
+            HeadingLevel::H2 => 1.10,
+            HeadingLevel::H3 => 1.05,
+            HeadingLevel::H4 => 1.00,
+            HeadingLevel::H5 => 0.95,
+            HeadingLevel::H6 => 0.875,
+        },
+        _ => match level {
+            HeadingLevel::H1 => 1.875,
+            HeadingLevel::H2 => 1.5,
+            HeadingLevel::H3 => 1.25,
+            HeadingLevel::H4 => 1.125,
+            HeadingLevel::H5 => 1.0,
+            HeadingLevel::H6 => 0.875,
+        },
     }
 }
 
@@ -463,6 +476,7 @@ pub(crate) fn render_math_expression(
 /// by source offset for O(log n) lookup during rendering.
 pub(crate) fn extract_math_expressions(
     events: &[(Range<usize>, MarkdownEvent)],
+    font: Option<crate::MarkdownFont>,
 ) -> BTreeMap<usize, ParsedMarkdownMathExpression> {
     let mut expressions = BTreeMap::default();
     let mut current_heading_level: Option<pulldown_cmark::HeadingLevel> = None;
@@ -482,7 +496,7 @@ pub(crate) fn extract_math_expressions(
                         source_range: source_range.clone(),
                         latex: SharedString::from(latex.trim()),
                         is_display: false,
-                        font_scale: heading_level_font_scale(current_heading_level),
+                        font_scale: heading_level_font_scale(current_heading_level, font),
                     },
                 );
             }
@@ -493,7 +507,7 @@ pub(crate) fn extract_math_expressions(
                         source_range: source_range.clone(),
                         latex: SharedString::from(latex.trim()),
                         is_display: true,
-                        font_scale: heading_level_font_scale(current_heading_level),
+                        font_scale: heading_level_font_scale(current_heading_level, font),
                     },
                 );
             }
@@ -513,7 +527,7 @@ mod tests {
     fn test_extract_inline_math() {
         let input = "Hello $x^2$ world";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert_eq!(expressions.len(), 1);
         let expr = expressions.values().next().unwrap();
         assert_eq!(expr.latex.as_ref(), "x^2");
@@ -524,7 +538,7 @@ mod tests {
     fn test_extract_display_math() {
         let input = "$$\\frac{a}{b}$$";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert_eq!(expressions.len(), 1);
         let expr = expressions.values().next().unwrap();
         assert_eq!(expr.latex.as_ref(), "\\frac{a}{b}");
@@ -535,7 +549,7 @@ mod tests {
     fn test_extract_multiple_expressions() {
         let input = "Let $a$ and $b$ be variables. Then $$a + b = c$$";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert_eq!(expressions.len(), 3);
     }
 
@@ -543,7 +557,7 @@ mod tests {
     fn test_math_in_heading_has_scaled_font_size() {
         let input = "# Title with $E = mc^2$\n\n## Subtitle with $x^2$\n\nBody with $y$";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert_eq!(expressions.len(), 3);
         let exprs: Vec<_> = expressions.values().collect();
         assert_eq!(exprs[0].latex.as_ref(), "E = mc^2");
@@ -552,13 +566,21 @@ mod tests {
         assert_eq!(exprs[1].font_scale, 1.5);
         assert_eq!(exprs[2].latex.as_ref(), "y");
         assert_eq!(exprs[2].font_scale, 1.0);
+
+        // Also test Agent font heading scale
+        let agent_expressions =
+            extract_math_expressions(&parsed.events, Some(crate::MarkdownFont::Agent));
+        let agent_exprs: Vec<_> = agent_expressions.values().collect();
+        assert_eq!(agent_exprs[0].font_scale, 1.15);
+        assert_eq!(agent_exprs[1].font_scale, 1.10);
+        assert_eq!(agent_exprs[2].font_scale, 1.0);
     }
 
     #[test]
     fn test_no_math_in_code_blocks() {
         let input = "```\n$x^2$\n```";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert!(expressions.is_empty());
     }
 
@@ -566,7 +588,7 @@ mod tests {
     fn test_no_math_in_inline_code() {
         let input = "Use `$x^2$` to represent a parabola";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert!(expressions.is_empty());
     }
 
@@ -574,7 +596,7 @@ mod tests {
     fn test_math_with_complex_latex() {
         let input = "$\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}$";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert_eq!(expressions.len(), 1);
         let expr = expressions.values().next().unwrap();
         assert_eq!(
@@ -587,7 +609,7 @@ mod tests {
     fn test_math_source_range_includes_delimiters() {
         let input = "Hello $x^2$ world";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         let expr = expressions.values().next().unwrap();
         // Source range should include the $ delimiters
         assert_eq!(&input[expr.source_range.clone()], "$x^2$");
@@ -611,7 +633,7 @@ mod tests {
     fn test_display_math_standalone() {
         let input = "$$\n\\sum_{i=1}^n i = \\frac{n(n+1)}{2}\n$$";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert_eq!(expressions.len(), 1);
         let expr = expressions.values().next().unwrap();
         assert!(expr.is_display);
@@ -622,7 +644,7 @@ mod tests {
     fn test_display_math_multiline_trimmed() {
         let input = "$$\n\\int_0^\\infty e^{-x^2}dx=\\frac{\\sqrt\\pi}{2}\n$$";
         let parsed = parse_markdown_with_options(input, false, false, false);
-        let expressions = extract_math_expressions(&parsed.events);
+        let expressions = extract_math_expressions(&parsed.events, None);
         assert_eq!(expressions.len(), 1);
         let expr = expressions.values().next().unwrap();
         assert!(expr.is_display);
@@ -635,7 +657,7 @@ mod tests {
     #[test]
     fn test_extract_math_from_empty_events() {
         let events: &[(Range<usize>, MarkdownEvent)] = &[];
-        let expressions = extract_math_expressions(events);
+        let expressions = extract_math_expressions(events, None);
         assert!(expressions.is_empty());
     }
 

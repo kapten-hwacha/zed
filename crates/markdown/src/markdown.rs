@@ -1347,6 +1347,7 @@ impl Markdown {
         let should_parse_html = self.options.parse_html;
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
         let should_render_math = self.options.render_math;
+        let markdown_font = self.options.font;
         let should_parse_heading_slugs = self.options.parse_heading_slugs;
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
         let language_registry = self.language_registry.clone();
@@ -1397,7 +1398,7 @@ impl Markdown {
                 BTreeMap::default()
             };
             let math_expressions = if should_render_math {
-                math::extract_math_expressions(&events)
+                math::extract_math_expressions(&events, markdown_font)
             } else {
                 BTreeMap::default()
             };
@@ -2194,6 +2195,7 @@ impl MarkdownElement {
         markdown_end: usize,
         text_align_override: Option<TextAlign>,
     ) {
+        builder.heading_depth += 1;
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
         let mut heading = div().mt_4().mb_2();
         heading = apply_heading_style(
@@ -2217,6 +2219,16 @@ impl MarkdownElement {
             heading_level_style(level, self.style.heading_level_styles.as_ref())
         {
             heading_text_style.refine(level_style);
+        } else {
+            let font_size = match level {
+                pulldown_cmark::HeadingLevel::H1 => rems(1.875),
+                pulldown_cmark::HeadingLevel::H2 => rems(1.5),
+                pulldown_cmark::HeadingLevel::H3 => rems(1.25),
+                pulldown_cmark::HeadingLevel::H4 => rems(1.125),
+                pulldown_cmark::HeadingLevel::H5 => rems(1.0),
+                pulldown_cmark::HeadingLevel::H6 => rems(0.875),
+            };
+            heading_text_style.font_size = Some(font_size.into());
         }
 
         builder.push_text_style(TextStyleRefinement {
@@ -2227,6 +2239,7 @@ impl MarkdownElement {
     }
 
     fn pop_markdown_heading(&self, builder: &mut MarkdownElementBuilder) {
+        builder.heading_depth = builder.heading_depth.saturating_sub(1);
         builder.pop_div();
         builder.pop_text_style();
     }
@@ -3543,6 +3556,7 @@ impl Element for MarkdownElement {
                                 .style
                                 .height_is_multiple_of_line_height
                                 && text_style.line_height == self.style.base_text_style.line_height
+                                && builder.heading_depth == 0
                             {
                                 rems(1.3).into()
                             } else {
@@ -4025,6 +4039,7 @@ struct MarkdownElementBuilder {
     text_style_stack: Vec<TextStyleRefinement>,
     code_block_stack: Vec<Option<Arc<Language>>>,
     link_depth: usize,
+    heading_depth: usize,
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
@@ -4145,6 +4160,7 @@ impl MarkdownElementBuilder {
             text_style_stack: Vec::new(),
             code_block_stack: Vec::new(),
             link_depth: 0,
+            heading_depth: 0,
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
@@ -9089,6 +9105,25 @@ mod tests {
             cx,
         );
         assert_eq!(rendered.text_for_range(0..input.len()), input);
+    }
+
+    #[gpui::test]
+    fn test_inline_math_in_heading_renders(cx: &mut TestAppContext) {
+        let input = "### Heading with $s \\approx -3.51$ math";
+        let rendered = render_markdown_with_options(
+            input,
+            None,
+            MarkdownOptions {
+                render_math: true,
+                font: Some(MarkdownFont::Agent),
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(
+            rendered.text_for_range(0..input.len()),
+            "Heading with $s \\approx -3.51$ math"
+        );
     }
 
     fn render_markdown_with_code_span_link(
