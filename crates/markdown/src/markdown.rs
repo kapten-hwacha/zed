@@ -1,4 +1,5 @@
 pub mod html;
+mod math;
 mod mermaid;
 pub mod parser;
 mod path_range;
@@ -11,6 +12,7 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
+use math::{MathState, render_math_expression};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
@@ -112,6 +114,7 @@ pub struct MarkdownStyle {
     pub code_block: StyleRefinement,
     pub code_block_overflow_x_scroll: bool,
     pub inline_code: TextStyleRefinement,
+    pub inline_math: TextStyleRefinement,
     pub block_quote: TextStyleRefinement,
     pub link: TextStyleRefinement,
     pub link_callback: Option<LinkStyleCallback>,
@@ -143,6 +146,7 @@ impl Default for MarkdownStyle {
             code_block: Default::default(),
             code_block_overflow_x_scroll: false,
             inline_code: Default::default(),
+            inline_math: Default::default(),
             block_quote: Default::default(),
             link: Default::default(),
             link_callback: None,
@@ -166,7 +170,7 @@ impl Default for MarkdownStyle {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MarkdownFont {
     Agent,
     Editor,
@@ -224,7 +228,7 @@ impl MarkdownStyle {
         let line_height = buffer_font_size * 1.75;
 
         text_style.refine(&TextStyleRefinement {
-            font_family: Some(body_font_family),
+            font_family: Some(body_font_family.clone()),
             font_fallbacks: theme_settings.ui_font.fallbacks.clone(),
             font_features: Some(theme_settings.ui_font.features.clone()),
             font_size: Some(if is_preview {
@@ -294,6 +298,15 @@ impl MarkdownStyle {
                 font_size: Some(buffer_font_size.into()),
                 font_weight: Some(buffer_font_weight),
                 background_color: Some(colors.editor_foreground.opacity(0.08)),
+                ..Default::default()
+            },
+            inline_math: TextStyleRefinement {
+                font_family: Some(body_font_family),
+                font_fallbacks: theme_settings.ui_font.fallbacks.clone(),
+                font_features: Some(theme_settings.ui_font.features.clone()),
+                font_size: Some(ui_font_size.into()),
+                font_weight: Some(buffer_font_weight),
+                color: Some(colors.text),
                 ..Default::default()
             },
             link: TextStyleRefinement {
@@ -502,7 +515,8 @@ pub struct Markdown {
     fallback_code_block_language: Option<LanguageName>,
     options: MarkdownOptions,
     mermaid_state: MermaidState,
-    _mermaid_theme_subscription: Option<Subscription>,
+    _theme_subscriptions: Vec<Subscription>,
+    math_state: MathState,
     /// Per-diagram view state (current tab, zoom, scroll position, and pending
     /// debounced re-raster) keyed by source offset. Distinct from
     /// [`MermaidState`], which caches the rendered diagrams themselves keyed by
@@ -519,16 +533,18 @@ pub struct Markdown {
     active_search_highlight: Option<usize>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct MarkdownOptions {
     pub parse_links_only: bool,
     pub parse_html: bool,
     pub render_mermaid_diagrams: bool,
+    pub render_math: bool,
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
     /// Defers parsing until the first [`MarkdownElement`] layout or [`Markdown::ensure_parsed`].
     /// After parsing starts, source updates parse eagerly even when off-screen.
     pub defer_parsing: bool,
+    pub font: Option<MarkdownFont>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -696,15 +712,48 @@ impl Markdown {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        let theme_subscription = if options.render_mermaid_diagrams {
-            Some(
-                cx.observe_global::<theme::GlobalTheme>(|this: &mut Self, cx| {
-                    this.invalidate_mermaid_cache(cx);
-                }),
-            )
-        } else {
-            None
-        };
+        let mut theme_subscriptions = Vec::new();
+        if options.render_mermaid_diagrams || options.render_math {
+            theme_subscriptions.push(cx.observe_global::<theme::GlobalTheme>(
+                |this: &mut Self, cx| {
+                    if this.options.render_mermaid_diagrams {
+                        this.invalidate_mermaid_cache(cx);
+                    }
+                    if this.options.render_math {
+                        this.invalidate_math_cache(cx);
+                    }
+                },
+            ));
+        }
+        if options.render_math {
+            theme_subscriptions.push(cx.observe_global::<theme_settings::ThemeSettings>(
+                |this: &mut Self, cx| {
+                    this.invalidate_math_cache(cx);
+                },
+            ));
+            theme_subscriptions.push(cx.observe_global::<theme_settings::AgentUiFontSize>(
+                |this: &mut Self, cx| {
+                    this.invalidate_math_cache(cx);
+                },
+            ));
+            theme_subscriptions.push(cx.observe_global::<theme_settings::AgentBufferFontSize>(
+                |this: &mut Self, cx| {
+                    this.invalidate_math_cache(cx);
+                },
+            ));
+            theme_subscriptions.push(
+                cx.observe_global::<theme_settings::MarkdownPreviewFontSize>(
+                    |this: &mut Self, cx| {
+                        this.invalidate_math_cache(cx);
+                    },
+                ),
+            );
+            theme_subscriptions.push(cx.observe_global::<theme_settings::UiFontSize>(
+                |this: &mut Self, cx| {
+                    this.invalidate_math_cache(cx);
+                },
+            ));
+        }
         let mut this = Self {
             source,
             selection: Selection::default(),
@@ -723,7 +772,8 @@ impl Markdown {
             fallback_code_block_language,
             options,
             mermaid_state: MermaidState::default(),
-            _mermaid_theme_subscription: theme_subscription,
+            _theme_subscriptions: theme_subscriptions,
+            math_state: MathState::default(),
             mermaid_views: HashMap::default(),
             copied_code_blocks: HashSet::default(),
             wrapped_code_blocks: HashSet::default(),
@@ -793,6 +843,70 @@ impl Markdown {
             cx,
         );
         cx.notify();
+    }
+
+    fn current_text_color(&self, cx: &gpui::App) -> gpui::Hsla {
+        if self.options.font == Some(MarkdownFont::Preview)
+            && cx.has_global::<settings::SettingsStore>()
+        {
+            let theme_settings = ThemeSettings::get_global(cx);
+            if let Some(theme_selection) = theme_settings.markdown_preview_theme.as_ref() {
+                let appearance = if cx.has_global::<theme::GlobalTheme>() {
+                    theme::SystemAppearance::global(cx).0
+                } else {
+                    theme::Appearance::Dark
+                };
+                let theme_name = theme_selection.name(appearance);
+                if let Ok(theme) = theme::ThemeRegistry::global(cx).get(&theme_name.0) {
+                    return theme.colors().text;
+                }
+            }
+        }
+        if cx.has_global::<theme::GlobalTheme>() {
+            cx.theme().colors().text
+        } else {
+            gpui::black()
+        }
+    }
+
+    pub fn invalidate_math_cache(&mut self, cx: &mut Context<Self>) {
+        if !self.options.render_math || self.parsed_markdown.math_expressions.is_empty() {
+            return;
+        }
+
+        let theme_settings = ThemeSettings::get_global(cx);
+        let base_font_size = match self.options.font {
+            Some(MarkdownFont::Agent) => theme_settings.agent_ui_font_size(cx).as_f32(),
+            Some(MarkdownFont::Preview) => theme_settings.markdown_preview_font_size(cx).as_f32(),
+            _ => theme_settings.ui_font_size(cx).as_f32(),
+        };
+        let text_color = self.current_text_color(cx);
+        let font_size = base_font_size * crate::math::MATH_FONT_SCALE_FACTOR;
+        if (self.math_state.font_size() - font_size).abs() > 0.01 {
+            let parsed = self.parsed_markdown.clone();
+            self.math_state.update(&parsed, font_size, text_color, cx);
+        } else {
+            self.math_state.retheme(text_color, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn ensure_math_font_size(&mut self, base_font_size: f32, cx: &mut Context<Self>) {
+        if !self.options.render_math
+            || self.parsed_markdown.math_expressions.is_empty()
+            || base_font_size <= 0.0
+        {
+            return;
+        }
+
+        let target_font_size = base_font_size * crate::math::MATH_FONT_SCALE_FACTOR;
+        if (self.math_state.font_size() - target_font_size).abs() > 0.01 {
+            let parsed = self.parsed_markdown.clone();
+            let text_color = self.current_text_color(cx);
+            self.math_state
+                .update(&parsed, target_font_size, text_color, cx);
+            cx.notify();
+        }
     }
 
     pub(crate) fn is_mermaid_showing_code(&self, source_offset: usize) -> bool {
@@ -1272,6 +1386,8 @@ impl Markdown {
         let should_parse_links_only = self.options.parse_links_only;
         let should_parse_html = self.options.parse_html;
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
+        let should_render_math = self.options.render_math;
+        let markdown_font = self.options.font;
         let should_parse_heading_slugs = self.options.parse_heading_slugs;
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
         let language_registry = self.language_registry.clone();
@@ -1289,6 +1405,7 @@ impl Markdown {
                         html_blocks: BTreeMap::default(),
                         metadata_blocks: BTreeMap::default(),
                         mermaid_diagrams: BTreeMap::default(),
+                        math_expressions: BTreeMap::default(),
                         heading_slugs: HashMap::default(),
                         footnote_definitions: HashMap::default(),
                         link_definition_spans: Arc::default(),
@@ -1317,6 +1434,11 @@ impl Markdown {
             let has_untagged_code_block = parsed.has_untagged_code_block;
             let mermaid_diagrams = if should_render_mermaid_diagrams {
                 extract_mermaid_diagrams(&source, &events)
+            } else {
+                BTreeMap::default()
+            };
+            let math_expressions = if should_render_math {
+                math::extract_math_expressions(&events, markdown_font)
             } else {
                 BTreeMap::default()
             };
@@ -1386,6 +1508,7 @@ impl Markdown {
                 html_blocks,
                 metadata_blocks,
                 mermaid_diagrams,
+                math_expressions,
                 heading_slugs,
                 footnote_definitions,
                 link_definition_spans: Arc::from(link_definition_spans),
@@ -1424,6 +1547,23 @@ impl Markdown {
                 } else {
                     this.mermaid_state.clear(cx);
                     this.mermaid_views.clear();
+                }
+                if this.options.render_math {
+                    let parsed_markdown = this.parsed_markdown.clone();
+                    let theme_settings = ThemeSettings::get_global(cx);
+                    let base_font_size = match this.options.font {
+                        Some(MarkdownFont::Agent) => theme_settings.agent_ui_font_size(cx).as_f32(),
+                        Some(MarkdownFont::Preview) => {
+                            theme_settings.markdown_preview_font_size(cx).as_f32()
+                        }
+                        _ => theme_settings.ui_font_size(cx).as_f32(),
+                    };
+                    let text_color = this.current_text_color(cx);
+                    let font_size = base_font_size * crate::math::MATH_FONT_SCALE_FACTOR;
+                    this.math_state
+                        .update(&parsed_markdown, font_size, text_color, cx);
+                } else {
+                    this.math_state.clear();
                 }
                 this.pending_parse.take();
                 if this.should_reparse {
@@ -1535,6 +1675,7 @@ pub struct ParsedMarkdown {
     pub(crate) html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
     pub(crate) metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
     pub(crate) mermaid_diagrams: BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
+    pub(crate) math_expressions: BTreeMap<usize, math::ParsedMarkdownMathExpression>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
     pub(crate) link_definition_spans: Arc<[Range<usize>]>,
@@ -2057,6 +2198,11 @@ impl MarkdownElement {
         text_align_override: Option<TextAlign>,
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
+        let line_height_refinement = if !self.style.height_is_multiple_of_line_height {
+            Some(rems(1.3).into())
+        } else {
+            None
+        };
         let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
             el.mb(self.style.paragraph_spacing)
                 .line_height(self.style.paragraph_line_height)
@@ -2070,6 +2216,7 @@ impl MarkdownElement {
 
         builder.push_text_style(TextStyleRefinement {
             text_align: Some(align),
+            line_height: line_height_refinement,
             ..Default::default()
         });
         builder.push_div(paragraph, range, markdown_end);
@@ -2088,6 +2235,7 @@ impl MarkdownElement {
         markdown_end: usize,
         text_align_override: Option<TextAlign>,
     ) {
+        builder.heading_depth += 1;
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
         let mut heading = div().mt_4().mb_2();
         heading = apply_heading_style(
@@ -2111,6 +2259,16 @@ impl MarkdownElement {
             heading_level_style(level, self.style.heading_level_styles.as_ref())
         {
             heading_text_style.refine(level_style);
+        } else {
+            let font_size = match level {
+                pulldown_cmark::HeadingLevel::H1 => rems(1.875),
+                pulldown_cmark::HeadingLevel::H2 => rems(1.5),
+                pulldown_cmark::HeadingLevel::H3 => rems(1.25),
+                pulldown_cmark::HeadingLevel::H4 => rems(1.125),
+                pulldown_cmark::HeadingLevel::H5 => rems(1.0),
+                pulldown_cmark::HeadingLevel::H6 => rems(0.875),
+            };
+            heading_text_style.font_size = Some(font_size.into());
         }
 
         builder.push_text_style(TextStyleRefinement {
@@ -2121,6 +2279,7 @@ impl MarkdownElement {
     }
 
     fn pop_markdown_heading(&self, builder: &mut MarkdownElementBuilder) {
+        builder.heading_depth = builder.heading_depth.saturating_sub(1);
         builder.pop_div();
         builder.pop_text_style();
     }
@@ -2296,6 +2455,11 @@ impl MarkdownElement {
         range: &Range<usize>,
         markdown_end: usize,
     ) {
+        let line_height_refinement = if !self.style.height_is_multiple_of_line_height {
+            Some(rems(1.3).into())
+        } else {
+            None
+        };
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
@@ -2309,11 +2473,16 @@ impl MarkdownElement {
             range,
             markdown_end,
         );
+        builder.push_text_style(TextStyleRefinement {
+            line_height: line_height_refinement,
+            ..Default::default()
+        });
         builder.push_div(div().flex_1().min_w_0(), range, markdown_end);
     }
 
     fn pop_markdown_list_item(&self, builder: &mut MarkdownElementBuilder) {
         builder.pop_div();
+        builder.pop_text_style();
         builder.pop_div();
     }
 
@@ -2643,8 +2812,16 @@ impl Element for MarkdownElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        self.markdown
-            .update(cx, |markdown, cx| markdown.ensure_parsed(cx));
+        let base_font_size = self
+            .style
+            .base_text_style
+            .font_size
+            .to_pixels(window.rem_size())
+            .as_f32();
+        self.markdown.update(cx, |markdown, cx| {
+            markdown.ensure_parsed(cx);
+            markdown.ensure_math_font_size(base_font_size, cx);
+        });
 
         let highlights = {
             let markdown = self.markdown.read(cx);
@@ -2665,7 +2842,15 @@ impl Element for MarkdownElement {
             }
         };
 
-        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
+        let (
+            parsed_markdown,
+            images,
+            active_root_block,
+            render_mermaid_diagrams,
+            mermaid_state,
+            render_math,
+            math_state,
+        ) = {
             let markdown = self.markdown.read(cx);
             (
                 markdown.parsed_markdown.clone(),
@@ -2673,6 +2858,8 @@ impl Element for MarkdownElement {
                 markdown.active_root_block,
                 markdown.options.render_mermaid_diagrams,
                 markdown.mermaid_state.clone(),
+                markdown.options.render_math,
+                markdown.math_state.clone(),
             )
         };
         let mut builder = MarkdownElementBuilder::new(
@@ -3408,6 +3595,79 @@ impl Element for MarkdownElement {
                     builder.push_text(&format!("[{label}]"), range.clone());
                     builder.pop_text_style();
                 }
+                MarkdownEvent::InlineMath(_) => {
+                    if render_math {
+                        if let Some(expr) = parsed_markdown.math_expressions.get(&range.start) {
+                            let text_style = builder.text_style();
+                            let text_font_size = text_style.font_size.to_pixels(window.rem_size());
+                            let line_height_length = if !self
+                                .style
+                                .height_is_multiple_of_line_height
+                                && text_style.line_height == self.style.base_text_style.line_height
+                                && builder.heading_depth == 0
+                            {
+                                rems(1.3).into()
+                            } else {
+                                text_style.line_height
+                            };
+                            let text_line_height = window.pixel_snap(
+                                line_height_length
+                                    .to_pixels(text_font_size.into(), window.rem_size()),
+                            );
+                            let text_system = cx.text_system();
+                            let font_id = text_system.resolve_font(&text_style.font());
+                            let text_ascent = text_system.ascent(font_id, text_font_size);
+                            let text_descent = text_system.descent(font_id, text_font_size).abs();
+                            let padding_top = (text_line_height - text_ascent - text_descent) / 2.0;
+                            let text_baseline = (padding_top + text_ascent).as_f32();
+
+                            let raw_source = &parsed_markdown.source[range.clone()];
+                            builder.push_inline_sourced_element(
+                                range.clone(),
+                                raw_source,
+                                render_math_expression(expr, &math_state, Some(text_baseline)),
+                            );
+                        }
+                    } else {
+                        // Fallback: render as styled inline code.
+                        let mut code_style = self.style.inline_code.clone();
+                        if builder.link_depth > 0 {
+                            code_style.color = self.style.link.color.or(code_style.color);
+                        }
+                        builder.push_text_style(code_style);
+                        builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                        builder.pop_text_style();
+                    }
+                }
+                MarkdownEvent::DisplayMath(_) => {
+                    if render_math {
+                        if let Some(expr) = parsed_markdown.math_expressions.get(&range.start) {
+                            let raw_source = &parsed_markdown.source[range.clone()];
+                            let copy_button = render_copy_code_block_button(
+                                range.start,
+                                expr.latex.to_string(),
+                                self.markdown.clone(),
+                            )
+                            .into_any_element();
+                            builder.push_display_sourced_element(
+                                range.clone(),
+                                raw_source,
+                                render_math_expression(expr, &math_state, None),
+                                Some(copy_button),
+                            );
+                        }
+                    } else {
+                        // Fallback: render as centered code block.
+                        builder.push_div(
+                            div().text_center().py_2().px_4().child(
+                                div().child(parsed_markdown.source[range.clone()].to_string()),
+                            ),
+                            range,
+                            markdown_end,
+                        );
+                        builder.pop_div();
+                    }
+                }
             }
         }
         if self.style.code_block_overflow_x_scroll {
@@ -3827,10 +4087,12 @@ struct MarkdownElementBuilder {
     text_style_stack: Vec<TextStyleRefinement>,
     code_block_stack: Vec<Option<Arc<Language>>>,
     link_depth: usize,
+    heading_depth: usize,
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
     highlights: MarkdownHighlights,
+    last_child_was_inline: bool,
 }
 
 struct MarkdownHighlights {
@@ -3946,10 +4208,12 @@ impl MarkdownElementBuilder {
             text_style_stack: Vec::new(),
             code_block_stack: Vec::new(),
             link_depth: 0,
+            heading_depth: 0,
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
             highlights,
+            last_child_was_inline: false,
         }
     }
 
@@ -4059,10 +4323,12 @@ impl MarkdownElementBuilder {
             }
         });
         self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
+        self.last_child_was_inline = false;
         self.append_child(child.into_any_element());
     }
 
     fn push_line_break(&mut self, source_range: Range<usize>) {
+        self.last_child_was_inline = false;
         if self.uses_flex_line_breaks() {
             self.modify_current_div(|el| el.child(div().w_full().h_0()));
         } else {
@@ -4071,9 +4337,14 @@ impl MarkdownElementBuilder {
     }
 
     fn push_soft_break(&mut self, source_range: Range<usize>) {
-        // A soft break right after an item in flex wrap container would otherwise
-        // render as a stray leading space before the next wrapped item.
-        if self.uses_flex_line_breaks() && self.pending_line.text.is_empty() {
+        // In flex wrap containers, a soft break right after a block-level item (like an image
+        // or a <br>) would render as a stray leading space before the next wrapped item.
+        // However, if the preceding item was an inline element (like inline math), the soft
+        // break represents word spacing in continuous text and must be preserved.
+        if self.uses_flex_line_breaks()
+            && self.pending_line.text.is_empty()
+            && !self.last_child_was_inline
+        {
             return;
         }
         self.push_text(" ", source_range);
@@ -4134,12 +4405,86 @@ impl MarkdownElementBuilder {
 
     fn push_sourced_element(&mut self, source_range: Range<usize>, element: impl Into<AnyElement>) {
         self.flush_text();
-        let anchor = self.render_source_anchor(source_range);
+        let anchor = self.render_source_anchor(source_range, None, true);
         self.append_child(
             div()
                 .relative()
                 .child(anchor)
                 .child(element.into())
+                .into_any_element(),
+        );
+    }
+
+    /// Pushes an inline math element that flows inline with surrounding text.
+    ///
+    /// Unlike `push_sourced_element`, this converts the parent div to flex layout
+    /// so the math image participates in the inline flow alongside text runs,
+    /// rather than breaking into a separate block.
+    fn push_inline_sourced_element(
+        &mut self,
+        source_range: Range<usize>,
+        source_text: &str,
+        element: impl Into<AnyElement>,
+    ) {
+        if let Some(entry) = self.div_stack.last_mut() {
+            entry.line_break_mode = LineBreakMode::FlexWrap;
+        }
+        self.flush_text_inline();
+        let anchor = self.render_source_anchor(source_range, Some(source_text), false);
+        if let Some(mut entry) = self.div_stack.pop() {
+            entry.div = entry.div.flex().flex_row().flex_wrap().items_start();
+            self.div_stack.push(entry);
+        }
+        self.last_child_was_inline = true;
+        self.append_child(
+            div()
+                .relative()
+                .min_w_0()
+                .flex_shrink_0()
+                .child(anchor)
+                .child(element.into())
+                .into_any_element(),
+        );
+    }
+
+    /// Pushes a display math element as a centered standalone block.
+    ///
+    /// Unlike `push_sourced_element`, this wraps the math in a centered container
+    /// with vertical padding, matching the layout of display equations in
+    /// GitHub Markdown / Obsidian.
+    fn push_display_sourced_element(
+        &mut self,
+        source_range: Range<usize>,
+        source_text: &str,
+        element: impl Into<AnyElement>,
+        copy_button: Option<AnyElement>,
+    ) {
+        self.flush_text();
+        let anchor = self.render_source_anchor(source_range, Some(source_text), true);
+        self.append_child(
+            div()
+                .relative()
+                .group("display-math")
+                .child(anchor)
+                .when_some(copy_button, |this, btn| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top_1()
+                            .right_1()
+                            .invisible()
+                            .group_hover("display-math", |this| this.visible())
+                            .child(btn),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .w_full()
+                        .py_2()
+                        .child(element.into()),
+                )
                 .into_any_element(),
         );
     }
@@ -4194,6 +4539,7 @@ impl MarkdownElementBuilder {
     }
 
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
+        self.last_child_was_inline = false;
         self.push_highlighted_text(text, source_range, None);
     }
 
@@ -4318,10 +4664,15 @@ impl MarkdownElementBuilder {
         source_range_for_rendered(&self.pending_line.source_mappings, rendered)
     }
 
-    fn render_source_anchor(&mut self, source_range: Range<usize>) -> AnyElement {
+    fn render_source_anchor(
+        &mut self,
+        source_range: Range<usize>,
+        anchor_text: Option<&str>,
+        ends_with_newline: bool,
+    ) -> AnyElement {
         let mut text_style = self.base_text_style.clone();
         text_style.color = Hsla::transparent_black();
-        let text = "\u{200B}";
+        let text = anchor_text.unwrap_or("\u{200B}");
         let styled_text = StyledText::new(text).with_runs(vec![text_style.to_run(text.len())]);
         self.rendered_lines.push(Rc::new(RenderedLine {
             layout: styled_text.layout().clone(),
@@ -4333,6 +4684,7 @@ impl MarkdownElementBuilder {
             source_end: source_range.end,
             language: None,
             text_align: TextAlign::Left,
+            ends_with_newline,
             highlights: SmallVec::new(),
             code_chips: SmallVec::new(),
         }));
@@ -4346,6 +4698,14 @@ impl MarkdownElementBuilder {
     }
 
     fn flush_text(&mut self) {
+        self.flush_text_with_newline(true);
+    }
+
+    fn flush_text_inline(&mut self) {
+        self.flush_text_with_newline(false);
+    }
+
+    fn flush_text_with_newline(&mut self, ends_with_newline: bool) {
         let text_align = self.text_style().text_align;
         let line = mem::take(&mut self.pending_line);
         if line.text.is_empty() {
@@ -4372,17 +4732,26 @@ impl MarkdownElementBuilder {
                 .and_then(|entry| entry.as_ref())
                 .cloned(),
             text_align,
+            ends_with_newline,
             highlights,
             code_chips: line.code_chips.into_iter().collect(),
         });
         self.rendered_lines.push(rendered_line.clone());
-        self.append_child(
-            RenderedLineElement {
-                text,
-                line: rendered_line,
-            }
-            .into_any_element(),
-        );
+        let line_element = RenderedLineElement {
+            text,
+            line: rendered_line,
+        };
+        if self.uses_flex_line_breaks() {
+            self.append_child(
+                div()
+                    .min_w_0()
+                    .max_w_full()
+                    .child(line_element)
+                    .into_any_element(),
+            );
+        } else {
+            self.append_child(line_element.into_any_element());
+        }
     }
 
     fn build(mut self) -> RenderedMarkdown {
@@ -4478,6 +4847,7 @@ struct RenderedLine {
     source_end: usize,
     language: Option<Arc<Language>>,
     text_align: TextAlign,
+    ends_with_newline: bool,
     /// Highlighted source ranges intersecting this line, in paint order
     highlights: SmallVec<[(Range<usize>, Hsla); 1]>,
     /// Inline code chip ranges intersecting this line, in rendered indices
@@ -5134,10 +5504,14 @@ impl RenderedText {
             .min(text.len());
 
             accumulator.push_str(&text[start..end]);
-            accumulator.push('\n');
+            if line.ends_with_newline {
+                accumulator.push('\n');
+            }
         }
         // Remove trailing newline
-        accumulator.pop();
+        if accumulator.ends_with('\n') {
+            accumulator.pop();
+        }
         accumulator
     }
 
@@ -8740,6 +9114,204 @@ mod tests {
 
     fn render_markdown(markdown: &str, cx: &mut TestAppContext) -> RenderedText {
         render_markdown_with_language_registry(markdown, None, cx)
+    }
+
+    #[gpui::test]
+    fn test_copy_inline_math_copies_latex(cx: &mut TestAppContext) {
+        let input = "The formula $E = mc^2$ is true.";
+        let rendered = render_markdown_with_options(
+            input,
+            None,
+            MarkdownOptions {
+                render_math: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(rendered.text_for_range(0..input.len()), input);
+
+        // Selecting just the formula itself copies the formula with delimiters:
+        let math_start = input.find('$').unwrap();
+        let math_end = input.rfind('$').unwrap() + 1;
+        assert_eq!(rendered.text_for_range(math_start..math_end), "$E = mc^2$");
+    }
+
+    #[gpui::test]
+    fn test_soft_break_after_inline_math_preserves_space(cx: &mut TestAppContext) {
+        let input = "Let $x$\nbe a variable.";
+        let rendered = render_markdown_with_options(
+            input,
+            None,
+            MarkdownOptions {
+                render_math: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let copied = rendered.text_for_range(0..input.len());
+        assert_eq!(
+            copied, "Let $x$ be a variable.",
+            "copied text must preserve space between inline math and following text across soft break; got: {copied:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_copy_display_math_copies_latex(cx: &mut TestAppContext) {
+        let input = "$$\n\\sum_{i=1}^n i = \\frac{n(n+1)}{2}\n$$";
+        let rendered = render_markdown_with_options(
+            input,
+            None,
+            MarkdownOptions {
+                render_math: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(rendered.text_for_range(0..input.len()), input);
+    }
+
+    #[gpui::test]
+    fn test_inline_math_in_heading_renders(cx: &mut TestAppContext) {
+        let input = "### Heading with $s \\approx -3.51$ math";
+        let rendered = render_markdown_with_options(
+            input,
+            None,
+            MarkdownOptions {
+                render_math: true,
+                font: Some(MarkdownFont::Agent),
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(
+            rendered.text_for_range(0..input.len()),
+            "Heading with $s \\approx -3.51$ math"
+        );
+    }
+
+    #[gpui::test]
+    fn test_math_scales_when_chat_font_size_changes(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let input = "Formula $E = mc^2$ in chat";
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                input.to_string().into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_math: true,
+                    font: Some(MarkdownFont::Agent),
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let initial_font_size = markdown.read_with(cx, |m, _| m.math_state.font_size());
+        assert!(initial_font_size > 0.0);
+
+        // Adjust agent UI font size (simulating cmd-+ in chat)
+        cx.update(|cx| {
+            theme_settings::adjust_agent_ui_font_size(cx, |size| size + px(4.0));
+        });
+        cx.run_until_parked();
+
+        let updated_font_size = markdown.read_with(cx, |m, _| m.math_state.font_size());
+        assert!(
+            (updated_font_size - (initial_font_size + 4.0 * crate::math::MATH_FONT_SCALE_FACTOR))
+                .abs()
+                < 0.05,
+            "math font size must scale with agent UI font size: expected {}, got {}",
+            initial_font_size + 4.0 * crate::math::MATH_FONT_SCALE_FACTOR,
+            updated_font_size
+        );
+    }
+
+    #[gpui::test]
+    fn test_math_scales_when_element_font_size_changes(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let input = "Formula $E = mc^2$ scaled";
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                input.to_string().into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_math: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Render with custom larger font size in MarkdownStyle
+        let window_cx = cx.add_empty_window();
+        let mut custom_style = MarkdownStyle::default();
+        custom_style.base_text_style.font_size = px(28.0).into();
+        window_cx.draw(
+            gpui::point(px(0.0), px(0.0)),
+            gpui::size(px(600.0), px(600.0)),
+            |_, _| MarkdownElement::new(markdown.clone(), custom_style).into_any_element(),
+        );
+        cx.run_until_parked();
+
+        let updated_size = markdown.read_with(cx, |m, _| m.math_state.font_size());
+        assert!(
+            (updated_size - 28.0 * crate::math::MATH_FONT_SCALE_FACTOR).abs() < 0.05,
+            "math font size must update to match element font size: expected {}, got {}",
+            28.0 * crate::math::MATH_FONT_SCALE_FACTOR,
+            updated_size
+        );
+    }
+
+    #[gpui::test]
+    fn test_text_with_inline_math_wraps_at_container_width(cx: &mut TestAppContext) {
+        let cases = [
+            "This is a very long prefix text that needs to wrap properly before $x$ appears, and then this is a very long text after that also wraps.",
+            "Let $a$ and $b$ be numbers such that $a + b = c$, where this is a long explanation that must wrap within the container width.",
+            "$x$ is a variable at the very start followed by a very long sentence that wraps properly across multiple lines in the layout.",
+            "A very long sentence that wraps properly across multiple lines before reaching the end of the text where we have $y$.",
+        ];
+
+        for input in cases {
+            let rendered = render_markdown_with_options_at_width(
+                input,
+                MarkdownOptions {
+                    render_math: true,
+                    ..Default::default()
+                },
+                px(200.0),
+                cx,
+            );
+            for (i, line) in rendered.lines.iter().enumerate() {
+                let bounds = line.layout.bounds();
+                assert!(
+                    bounds.size.width <= px(200.0) + px(1.0),
+                    "Input {:?}: Line {} width {:?} exceeds container width 200px (text: {:?})",
+                    input,
+                    i,
+                    bounds.size.width,
+                    line.layout.wrapped_text()
+                );
+            }
+        }
+    }
+
+    fn render_markdown_with_options_at_width(
+        markdown: &str,
+        options: MarkdownOptions,
+        width: Pixels,
+        cx: &mut TestAppContext,
+    ) -> RenderedText {
+        ensure_theme_initialized(cx);
+
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(markdown.to_string().into(), None, None, options, cx)
+        });
+        cx.run_until_parked();
+        render_markdown_entity_in_view(markdown, MarkdownStyle::default(), None, Some(width), cx)
     }
 
     fn render_markdown_with_code_span_link(
