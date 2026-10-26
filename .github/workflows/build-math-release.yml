@@ -1,0 +1,70 @@
+name: Build Zed with LaTeX Math
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: 'Rebase on upstream zed-industries/zed:main before building'
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    # Run weekly on Sunday at 04:00 UTC
+    - cron: '0 4 * * 0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Optionally sync with upstream
+        if: ${{ inputs.sync_upstream == true }}
+        run: |
+          git config --global user.name "Karl-Andres Parts"
+          git config --global user.email "karlandres.parts@gmail.com"
+          git remote add upstream https://github.com/zed-industries/zed.git || true
+          git fetch upstream main
+          git rebase upstream/main || (git rebase --abort && echo "Rebase conflict; building current branch instead")
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install cargo-bundle
+        run: |
+          cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+
+      - name: Build macOS Application Bundle (.dmg)
+        run: |
+          export CXXFLAGS="-stdlib=libc++"
+          ./script/generate-licenses
+          ./script/bundle-mac aarch64-apple-darwin
+
+      - name: Upload DMG Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-aarch64-math.dmg
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/markdown-math-rendering' || github.ref == 'refs/heads/main'
+        with:
+          tag_name: latest-math
+          name: "Zed with Native LaTeX Math (Nightly)"
+          body: |
+            Custom build of Zed for Apple Silicon macOS with native theme-aware LaTeX math rendering in Markdown preview and AI chat.
+            
+            Built automatically from branch `${{ github.ref_name }}`.
+          files: |
+            target/aarch64-apple-darwin/release/Zed-aarch64.dmg

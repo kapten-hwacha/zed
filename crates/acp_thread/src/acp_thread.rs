@@ -33,7 +33,7 @@ use language::language_settings::FormatOnSave;
 use language::{
     Anchor, Buffer, BufferEditSource, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff,
 };
-use markdown::{Markdown, MarkdownOptions};
+use markdown::{Markdown, MarkdownFont, MarkdownOptions};
 pub use mention::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{AgentLocation, Project};
@@ -2742,7 +2742,9 @@ impl ContentBlock {
                 MarkdownOptions {
                     render_mermaid_diagrams: true,
                     render_metadata_blocks: true,
+                    render_math: true,
                     defer_parsing: true,
+                    font: Some(MarkdownFont::Agent),
                     ..Default::default()
                 },
                 cx,
