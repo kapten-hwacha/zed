@@ -52,7 +52,10 @@ pub fn display_list_to_svg(display_list: &DisplayList, font_size: f32) -> MathSv
             };
         }
     };
-    let mut font_refs: HashMap<FontId, ab_glyph::FontRef<'_>> = HashMap::new();
+    let mut font_refs: HashMap<
+        FontId,
+        (ab_glyph::FontRef<'_>, ratex_font_loader::OutlineSourceId),
+    > = HashMap::new();
     let mut glyph_cache: HashMap<(FontId, u32), String> = HashMap::new();
 
     for item in &display_list.items {
@@ -199,25 +202,29 @@ fn resolve_glyph_path<'a>(
     font_id: FontId,
     ch: char,
     fonts: &'a FontSet,
-    font_refs: &mut HashMap<FontId, ab_glyph::FontRef<'a>>,
+    font_refs: &mut HashMap<FontId, (ab_glyph::FontRef<'a>, ratex_font_loader::OutlineSourceId)>,
 ) -> Option<String> {
     use ab_glyph::Font;
 
-    let font_data = fonts.get(&font_id)?;
     if !font_refs.contains_key(&font_id) {
-        if let Ok(font_ref) = ab_glyph::FontRef::try_from_slice(font_data) {
-            font_refs.insert(font_id, font_ref);
+        if let Some((_, font_data, source_id)) =
+            fonts.iter_with_source().find(|(id, _, _)| **id == font_id)
+        {
+            if let Ok(font_ref) = ab_glyph::FontRef::try_from_slice(font_data) {
+                font_refs.insert(font_id, (font_ref, source_id));
+            }
         }
     }
-    let font_ref = font_refs.get(&font_id)?;
+    let (font_ref, source_id) = font_refs.get(&font_id)?;
 
     let glyph_id = font_ref.glyph_id(ch);
     if glyph_id.0 == 0 {
         return None;
     }
 
-    let outlines =
-        ratex_font_loader::outline_cache::get_or_compute_outline(font_id, font_ref, glyph_id)?;
+    let outlines = ratex_font_loader::outline_cache::get_or_compute_outline_with_source_id(
+        font_id, font_ref, *source_id, glyph_id,
+    )?;
 
     let units_per_em = font_ref.units_per_em().unwrap_or(1000.0);
     let scale = 1000.0 / units_per_em;
