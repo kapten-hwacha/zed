@@ -855,7 +855,6 @@ prost-types = "0.14"
 protox = "0.9"
 proxyvars = "0.2"
 pulldown-cmark = { version = "0.13.0", default-features = false }
-ratex-render = { version = "0.1.13", features = ["embed-fonts"] }
 ratex-layout = "0.1.13"
 ratex-parser = "0.1.13"
 ratex-font = "0.1.13"

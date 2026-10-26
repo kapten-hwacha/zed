@@ -24,7 +24,6 @@ base64.workspace = true
 collections.workspace = true
 gpui.workspace = true
 html5ever.workspace = true
-image.workspace = true
 language.workspace = true
 linkify.workspace = true
 log.workspace = true

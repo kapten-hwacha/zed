@@ -274,10 +274,18 @@ impl MathState {
             }
         }
 
-        if self.cache.len() > 128 {
-            let new_key_set: std::collections::HashSet<_> =
-                new_keys.iter().map(|(k, _)| k.clone()).collect();
-            self.cache.retain(|key, _| new_key_set.contains(key));
+        if self.cache.len() > 512 {
+            let active_latex: std::collections::HashSet<_> =
+                new_keys.iter().map(|(k, _)| k.latex.clone()).collect();
+            // Retain entries for active formulas across font sizes for smooth fallback during zoom
+            self.cache
+                .retain(|key, _| active_latex.contains(&key.latex));
+            // If still over 512, strictly retain the exact new keys
+            if self.cache.len() > 512 {
+                let new_key_set: std::collections::HashSet<_> =
+                    new_keys.iter().map(|(k, _)| k.clone()).collect();
+                self.cache.retain(|key, _| new_key_set.contains(key));
+            }
         }
     }
 
@@ -347,6 +355,8 @@ impl CachedMathExpression {
                     })
                     .await;
                 *rd.lock().unwrap() = Some(result);
+            } else if let Some(Err(e)) = dt.get() {
+                *rd.lock().unwrap() = Some(Err(anyhow::anyhow!("{:#}", e)));
             }
 
             this.update(cx, |_, cx| cx.notify()).ok();
@@ -451,7 +461,6 @@ pub(crate) fn render_math_expression(
                     .flex()
                     .w_full()
                     .justify_center()
-                    .my_2()
                     .child(gpui::img(image))
                     .into_any_element()
             } else {
@@ -481,7 +490,6 @@ pub(crate) fn render_math_expression(
                         .flex()
                         .w_full()
                         .justify_center()
-                        .my_2()
                         .child(gpui::img(fallback_image).w(w).h(h))
                         .into_any_element()
                 } else {

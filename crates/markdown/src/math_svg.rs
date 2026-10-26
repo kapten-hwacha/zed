@@ -179,9 +179,10 @@ pub fn display_list_to_svg(display_list: &DisplayList, font_size: f32) -> MathSv
                 } else {
                     let d = path_commands_to_svg_d(commands, em, px, py);
                     if !d.is_empty() {
+                        let stroke_width = (0.08 * em).max(1.0);
                         svg.push_str(&format!(
                             "<path d=\"{}\" stroke=\"{}\" stroke-width=\"{:.2}\" fill=\"none\" />",
-                            d, color_str, 1.5
+                            d, color_str, stroke_width
                         ));
                     }
                 }
