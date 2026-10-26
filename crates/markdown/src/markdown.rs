@@ -4426,14 +4426,21 @@ impl MarkdownElementBuilder {
         source_text: &str,
         element: impl Into<AnyElement>,
     ) {
+        if let Some(entry) = self.div_stack.last_mut() {
+            entry.line_break_mode = LineBreakMode::FlexWrap;
+        }
         self.flush_text_inline();
         let anchor = self.render_source_anchor(source_range, Some(source_text), false);
-        self.modify_current_div(|el| el.flex().flex_row().flex_wrap().items_start());
-        self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
+        if let Some(mut entry) = self.div_stack.pop() {
+            entry.div = entry.div.flex().flex_row().flex_wrap().items_start();
+            self.div_stack.push(entry);
+        }
         self.last_child_was_inline = true;
         self.append_child(
             div()
                 .relative()
+                .min_w_0()
+                .flex_shrink_0()
                 .child(anchor)
                 .child(element.into())
                 .into_any_element(),
@@ -4730,13 +4737,21 @@ impl MarkdownElementBuilder {
             code_chips: line.code_chips.into_iter().collect(),
         });
         self.rendered_lines.push(rendered_line.clone());
-        self.append_child(
-            RenderedLineElement {
-                text,
-                line: rendered_line,
-            }
-            .into_any_element(),
-        );
+        let line_element = RenderedLineElement {
+            text,
+            line: rendered_line,
+        };
+        if self.uses_flex_line_breaks() {
+            self.append_child(
+                div()
+                    .min_w_0()
+                    .max_w_full()
+                    .child(line_element)
+                    .into_any_element(),
+            );
+        } else {
+            self.append_child(line_element.into_any_element());
+        }
     }
 
     fn build(mut self) -> RenderedMarkdown {
@@ -9249,6 +9264,54 @@ mod tests {
             28.0 * crate::math::MATH_FONT_SCALE_FACTOR,
             updated_size
         );
+    }
+
+    #[gpui::test]
+    fn test_text_with_inline_math_wraps_at_container_width(cx: &mut TestAppContext) {
+        let cases = [
+            "This is a very long prefix text that needs to wrap properly before $x$ appears, and then this is a very long text after that also wraps.",
+            "Let $a$ and $b$ be numbers such that $a + b = c$, where this is a long explanation that must wrap within the container width.",
+            "$x$ is a variable at the very start followed by a very long sentence that wraps properly across multiple lines in the layout.",
+            "A very long sentence that wraps properly across multiple lines before reaching the end of the text where we have $y$.",
+        ];
+
+        for input in cases {
+            let rendered = render_markdown_with_options_at_width(
+                input,
+                MarkdownOptions {
+                    render_math: true,
+                    ..Default::default()
+                },
+                px(200.0),
+                cx,
+            );
+            for (i, line) in rendered.lines.iter().enumerate() {
+                let bounds = line.layout.bounds();
+                assert!(
+                    bounds.size.width <= px(200.0) + px(1.0),
+                    "Input {:?}: Line {} width {:?} exceeds container width 200px (text: {:?})",
+                    input,
+                    i,
+                    bounds.size.width,
+                    line.layout.wrapped_text()
+                );
+            }
+        }
+    }
+
+    fn render_markdown_with_options_at_width(
+        markdown: &str,
+        options: MarkdownOptions,
+        width: Pixels,
+        cx: &mut TestAppContext,
+    ) -> RenderedText {
+        ensure_theme_initialized(cx);
+
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(markdown.to_string().into(), None, None, options, cx)
+        });
+        cx.run_until_parked();
+        render_markdown_entity_in_view(markdown, MarkdownStyle::default(), None, Some(width), cx)
     }
 
     fn render_markdown_with_code_span_link(
