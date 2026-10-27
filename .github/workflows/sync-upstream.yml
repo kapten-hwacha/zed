@@ -1,9 +1,6 @@
-name: Sync Upstream
+name: Sync Upstream (Manual)
 
 on:
-  schedule:
-    # Run weekly on Sunday at 02:00 UTC (2 hours before the weekly build)
-    - cron: '0 2 * * 0'
   workflow_dispatch:
 
 permissions:
@@ -38,7 +35,7 @@ jobs:
           echo "Merging upstream/main into main..."
           if git merge upstream/main --no-edit -m "chore(sync): merge upstream/main into main"; then
             echo "Merge successful. Pushing to origin/main..."
-            git push origin main
+            git push origin HEAD:main
           else
             echo "Merge conflict detected! Aborting merge to prevent repository corruption."
             git merge --abort

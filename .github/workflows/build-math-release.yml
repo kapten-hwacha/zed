@@ -2,12 +2,6 @@ name: Build Zed with LaTeX Math
 
 on:
   workflow_dispatch:
-    inputs:
-      sync_upstream:
-        description: 'Rebase on upstream zed-industries/zed:main before building'
-        required: true
-        type: boolean
-        default: false
   schedule:
     # Run weekly on Sunday at 04:00 UTC
     - cron: '0 4 * * 0'
@@ -16,12 +10,51 @@ permissions:
   contents: write
 
 jobs:
+  sync-upstream:
+    name: Sync Upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync with upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/zed-industries/zed.git || git remote set-url upstream https://github.com/zed-industries/zed.git
+          git fetch upstream main
+
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/main)
+          echo "Upstream is ahead by $BEHIND_COUNT commits."
+
+          if [ "$BEHIND_COUNT" -eq 0 ]; then
+            echo "Branch is already up to date with upstream/main. Nothing to merge."
+            exit 0
+          fi
+
+          echo "Merging upstream/main into main..."
+          if git merge upstream/main --no-edit -m "chore(sync): merge upstream/main into main"; then
+            echo "Merge successful. Pushing to origin/main..."
+            git push origin HEAD:main
+          else
+            echo "Merge conflict detected! Aborting merge to prevent repository corruption."
+            git merge --abort
+            exit 1
+          fi
+
   build-macos-arm64:
+    name: Build macOS ARM64 Bundle
+    needs: sync-upstream
     runs-on: macos-26
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           submodules: recursive
 
@@ -34,15 +67,6 @@ jobs:
             fi
           done
           xcodebuild -version
-
-      - name: Optionally sync with upstream
-        if: ${{ inputs.sync_upstream == true }}
-        run: |
-          git config --global user.name "Karl-Andres Parts"
-          git config --global user.email "karlandres.parts@gmail.com"
-          git remote add upstream https://github.com/zed-industries/zed.git || true
-          git fetch upstream main
-          git rebase upstream/main || (git rebase --abort && echo "Rebase conflict; building current branch instead")
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.98.1
