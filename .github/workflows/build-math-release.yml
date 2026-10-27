@@ -1,18 +1,27 @@
 name: Build Zed with LaTeX Math
 
 on:
-  workflow_dispatch:
   schedule:
-    # Run weekly on Sunday at 04:00 UTC
-    - cron: '0 4 * * 0'
+    # Check daily at 04:00 UTC for new stable upstream releases
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if already on the latest stable release'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
-  sync-upstream:
-    name: Sync Upstream
+  check-and-sync-upstream:
+    name: Check for New Stable Upstream Release
     runs-on: ubuntu-latest
+    outputs:
+      new_release: ${{ steps.check.outputs.new_release }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,35 +29,60 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Sync with upstream
+      - name: Check latest upstream stable release
+        id: check
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          LATEST_TAG=$(curl -sSf -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/zed-industries/zed/releases/latest | jq -r .tag_name)
 
-          git remote add upstream https://github.com/zed-industries/zed.git || git remote set-url upstream https://github.com/zed-industries/zed.git
-          git fetch upstream main
+          echo "Latest upstream stable release: $LATEST_TAG"
 
-          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/main)
-          echo "Upstream is ahead by $BEHIND_COUNT commits."
-
-          if [ "$BEHIND_COUNT" -eq 0 ]; then
-            echo "Branch is already up to date with upstream/main. Nothing to merge."
-            exit 0
-          fi
-
-          echo "Merging upstream/main into main..."
-          if git merge upstream/main --no-edit -m "chore(sync): merge upstream/main into main"; then
-            echo "Merge successful. Pushing to origin/main..."
-            git push origin HEAD:main
+          if [ -f .github/upstream-version.txt ]; then
+            CURRENT_TAG=$(cat .github/upstream-version.txt | tr -d '[:space:]')
           else
-            echo "Merge conflict detected! Aborting merge to prevent repository corruption."
-            git merge --abort
-            exit 1
+            CURRENT_TAG=""
+          fi
+          echo "Current recorded release: $CURRENT_TAG"
+
+          FORCE_BUILD="${{ inputs.force_build }}"
+
+          if [ "$LATEST_TAG" != "$CURRENT_TAG" ]; then
+            echo "New stable release detected: $LATEST_TAG (previously $CURRENT_TAG)"
+            echo "new_release=true" >> "$GITHUB_OUTPUT"
+            echo "release_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git remote add upstream https://github.com/zed-industries/zed.git || git remote set-url upstream https://github.com/zed-industries/zed.git
+            git fetch --no-tags upstream refs/tags/$LATEST_TAG:refs/tags/$LATEST_TAG
+
+            echo "Merging stable release $LATEST_TAG into main..."
+            if git merge refs/tags/$LATEST_TAG --no-edit -m "chore(sync): merge upstream stable release $LATEST_TAG"; then
+              echo "$LATEST_TAG" > .github/upstream-version.txt
+              git add .github/upstream-version.txt
+              git commit -m "chore: record upstream stable release $LATEST_TAG"
+              git push origin HEAD:main
+              echo "Merge and version update pushed successfully."
+            else
+              echo "Merge conflict detected while merging $LATEST_TAG! Aborting."
+              git merge --abort
+              exit 1
+            fi
+          elif [ "$FORCE_BUILD" = "true" ]; then
+            echo "Force build requested for $CURRENT_TAG."
+            echo "new_release=true" >> "$GITHUB_OUTPUT"
+            echo "release_tag=$CURRENT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already up to date with latest stable release ($LATEST_TAG). No build needed."
+            echo "new_release=false" >> "$GITHUB_OUTPUT"
+            echo "release_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
           fi
 
   build-macos-arm64:
     name: Build macOS ARM64 Bundle
-    needs: sync-upstream
+    needs: check-and-sync-upstream
+    if: needs.check-and-sync-upstream.outputs.new_release == 'true'
     runs-on: macos-26
     steps:
       - name: Checkout repository
@@ -93,13 +127,12 @@ jobs:
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/markdown-math-rendering' || github.ref == 'refs/heads/main'
         with:
           tag_name: latest-math
-          name: "Zed with Native LaTeX Math (Nightly)"
+          name: "Zed with Native LaTeX Math (${{ needs.check-and-sync-upstream.outputs.release_tag }})"
           body: |
             Custom build of Zed for Apple Silicon macOS with native theme-aware LaTeX math rendering in Markdown preview and AI chat.
             
-            Built automatically from branch `${{ github.ref_name }}`.
+            Based on official Zed stable release `${{ needs.check-and-sync-upstream.outputs.release_tag }}`.
           files: |
             target/aarch64-apple-darwin/release/Zed-aarch64.dmg
